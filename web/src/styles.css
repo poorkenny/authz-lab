@@ -244,3 +244,16 @@ tr.k-async td { background: var(--warn-wash); }
 @keyframes flash { 0% { background: var(--good); color: #fff; } 100% { background: transparent; } }
 @media (prefers-reduced-motion: reduce) { .qcard, .dchip.flash { animation: none; } }
 .sim-note { padding: 8px 12px; border-radius: 8px; background: var(--surface-2); border-left: 4px solid var(--accent); font-size: 0.92em; }
+
+/* Strategy stories and happy-path comparison */
+.steps li button.alt-btn { min-width: 0; font-size: 0.85em; padding: 2px 10px; background: var(--surface); border-color: var(--axis); }
+.freshness { margin-top: 14px; padding: 10px 14px; border-radius: 10px; background: var(--surface-2); border-left: 4px solid var(--axis); }
+.freshness.highlight { border-left-color: var(--accent); }
+.freshness h3 { margin: 0; }
+.happy-compare { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+@media (max-width: 560px) { .happy-compare { grid-template-columns: 1fr; } }
+.happy-col { padding: 8px 12px; border-radius: 8px; background: var(--surface); border: 1px solid var(--axis); border-left-width: 5px; }
+.happy-col.ok { border-left-color: var(--good); }
+.happy-col.bad { border-left-color: var(--critical); }
+.happy-note { grid-column: 1 / -1; margin: 0; }
+.freshness table { min-width: 680px; }

@@ -123,8 +123,26 @@ func (s *Server) newDemo(st demo.Strategy) (*demo.Demo, error) {
 	if err != nil {
 		return nil, err
 	}
-	d.AutoDeliver = !s.flags.ControlledCacheDelivery
+	d.Options = s.options()
 	return d, nil
+}
+
+// options maps the feature flags onto demo behaviours.
+func (s *Server) options() demo.Options {
+	return demo.Options{
+		AutoDeliver: !s.flags.ControlledCacheDelivery,
+		EnforceTTL:  s.flags.StrategyStories,
+		HappyPath:   s.flags.HappyPathComparison,
+	}
+}
+
+// requireStrategyStories rejects requests for the strategy-stories feature
+// (the simulated TTL clock) when its flag is off.
+func (s *Server) requireStrategyStories() error {
+	if !s.flags.StrategyStories {
+		return httpError{http.StatusNotFound, "strategy stories are disabled (FEATURE_STRATEGY_STORIES=false)"}
+	}
+	return nil
 }
 
 // requireControlledDelivery rejects requests for the controlled-cache-delivery
@@ -196,6 +214,21 @@ func (s *Server) Routes(mux *http.ServeMux) {
 		// A strategy change starts a fresh world so runs are comparable.
 		return s.reset(d, st, true)
 	}))
+	mux.HandleFunc("POST /api/v1/clock/advance", s.with(mainWorld, func(r *http.Request, d **demo.Demo) (any, error) {
+		if err := s.requireStrategyStories(); err != nil {
+			return nil, err
+		}
+		var req struct {
+			Seconds int `json:"seconds"`
+		}
+		if err := decode(r, &req); err != nil {
+			return nil, err
+		}
+		if req.Seconds < 1 || req.Seconds > 3600 {
+			return nil, badRequest(errors.New("seconds must be between 1 and 3600"))
+		}
+		return (*d).Advance(req.Seconds), nil
+	}))
 	mux.HandleFunc("POST /api/v1/sim/other-writes", s.with(simWorld, func(r *http.Request, d **demo.Demo) (any, error) {
 		var req struct {
 			Count int `json:"count"`
@@ -219,7 +252,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 		}
 		var rows []row
 		for _, st := range demo.Strategies {
-			before, after, err := demo.Story(st, !s.flags.ControlledCacheDelivery)
+			before, after, err := demo.Story(st, s.options())
 			if err != nil {
 				return nil, err
 			}

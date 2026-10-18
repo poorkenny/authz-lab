@@ -6,7 +6,8 @@
 // Three strategies:
 //
 //   - TTL: cache entries live until their TTL expires. Nothing tells the
-//     cache about writes.
+//     cache about writes. With EnforceTTL, expiry runs on a simulated clock
+//     that Advance fast-forwards, so the stale window can be shown to end.
 //   - Invalidation: after each SQLite commit an invalidation event is put on
 //     a delivery queue. Until it is delivered the cache still holds the old
 //     entry, so a read right after the write can return stale data. Delivery
@@ -21,6 +22,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/poorkenny/authz-lab/internal/audit"
 	"github.com/poorkenny/authz-lab/internal/store"
@@ -73,6 +75,25 @@ type CacheEntry struct {
 	Decision string `json:"decision"`
 	// Rev is the store revision the decision was computed at.
 	Rev int64 `json:"rev"`
+	// CachedAt is when the entry was written, on the demo's simulated clock.
+	CachedAt time.Time `json:"-"`
+	// AgeSec and ExpiresInSec describe the entry's freshness (filled in by State).
+	AgeSec       float64 `json:"ageSec"`
+	ExpiresInSec float64 `json:"expiresInSec"`
+}
+
+// Options are the demo behaviours controlled by feature flags.
+type Options struct {
+	// AutoDeliver delivers each invalidation event right after its commit
+	// instead of waiting for DeliverNext (controlled-cache-delivery flag off).
+	AutoDeliver bool
+	// EnforceTTL expires cache entries CacheTTLSec after they were cached, on
+	// a simulated clock that Advance can fast-forward (strategy-stories flag).
+	EnforceTTL bool
+	// HappyPath adds, to an invalidation-strategy read made while the user's
+	// invalidation is still queued, the result the read would have had if the
+	// event had been delivered first (happy-path-comparison flag).
+	HappyPath bool
 }
 
 type Demo struct {
@@ -80,12 +101,16 @@ type Demo struct {
 	Store    *store.Store
 	Audit    *audit.Log
 	Queue    *Queue
-	// AutoDeliver delivers each invalidation event right after its commit
-	// instead of waiting for DeliverNext (controlled-cache-delivery flag off).
-	AutoDeliver bool
+	Options
+	// Now is the wall clock (replaceable in tests); the simulated clock is
+	// Now plus the time skipped with Advance.
+	Now func() time.Time
 
+	start       time.Time
+	skew        time.Duration
 	cache       map[string]CacheEntry
 	invalidated map[string]QueueMsg // cache key → the delivery that removed it
+	expired     map[string]bool     // cache key → the entry was evicted by its TTL
 	seq         int
 	others      int // unrelated writes created by AddOtherWrites
 }
@@ -101,7 +126,8 @@ func New(strategy Strategy) (*Demo, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &Demo{Strategy: strategy, Store: st, Audit: &audit.Log{}, Queue: &Queue{}, cache: map[string]CacheEntry{}, invalidated: map[string]QueueMsg{}}
+	d := &Demo{Strategy: strategy, Store: st, Audit: &audit.Log{}, Queue: &Queue{}, Now: time.Now, start: time.Now(),
+		cache: map[string]CacheEntry{}, invalidated: map[string]QueueMsg{}, expired: map[string]bool{}}
 	for _, t := range []store.Tuple{
 		{Object: "doc:42", Relation: "owner", Subject: "user:bob"},
 		{Object: "doc:7", Relation: "owner", Subject: "user:bob"},
@@ -116,6 +142,55 @@ func New(strategy Strategy) (*Demo, error) {
 }
 
 func (d *Demo) Close() error { return d.Store.Close() }
+
+// clock is the simulated time: wall time plus everything skipped with Advance.
+func (d *Demo) clock() time.Time { return d.Now().Add(d.skew) }
+
+// ClockSec is the simulated time in seconds since the world was created.
+func (d *Demo) ClockSec() float64 { return d.clock().Sub(d.start).Seconds() }
+
+func (d *Demo) age(e CacheEntry) float64 { return d.clock().Sub(e.CachedAt).Seconds() }
+
+type ClockResult struct {
+	AdvancedSec int          `json:"advancedSec"`
+	ClockSec    float64      `json:"clockSec"`
+	Evicted     []CacheEntry `json:"evicted"`
+	Note        string       `json:"note"`
+	Hops        []Hop        `json:"hops"`
+}
+
+// Advance fast-forwards the simulated clock and evicts every cache entry
+// that has reached its TTL.
+func (d *Demo) Advance(sec int) ClockResult {
+	d.skew += time.Duration(sec) * time.Second
+	r := ClockResult{AdvancedSec: sec, ClockSec: d.ClockSec(), Evicted: []CacheEntry{}, Hops: []Hop{}}
+	if d.EnforceTTL {
+		for key, e := range d.cache {
+			if d.age(e) >= CacheTTLSec {
+				delete(d.cache, key)
+				d.expired[key] = true
+				r.Evicted = append(r.Evicted, e)
+			}
+		}
+	}
+	sort.Slice(r.Evicted, func(i, j int) bool {
+		return cacheKey(r.Evicted[i].Subject, r.Evicted[i].Object) < cacheKey(r.Evicted[j].Subject, r.Evicted[j].Object)
+	})
+	names := []string{}
+	for _, e := range r.Evicted {
+		names = append(names, fmt.Sprintf("%s → %s %s @ rev %d", e.Subject, e.Object, e.Decision, e.Rev))
+	}
+	switch {
+	case !d.EnforceTTL:
+		r.Note = fmt.Sprintf("Fast-forwarded the clock %d s. TTL expiry is disabled, so nothing was evicted.", sec)
+	case len(names) == 0:
+		r.Note = fmt.Sprintf("Fast-forwarded the clock %d s. No cache entry has reached its TTL (%d s) yet.", sec, CacheTTLSec)
+	default:
+		r.Note = fmt.Sprintf("Fast-forwarded the clock %d s. %d cache entr%s reached the TTL (%d s) and %s evicted: %s. The next read goes to SQLite.",
+			sec, len(names), map[bool]string{true: "y", false: "ies"}[len(names) == 1], CacheTTLSec, map[bool]string{true: "was", false: "were"}[len(names) == 1], strings.Join(names, ", "))
+	}
+	return r
+}
 
 func validate(subject, object string) error {
 	if !strings.HasPrefix(subject, "user:") || len(subject) > 64 {
@@ -258,6 +333,23 @@ type CheckResult struct {
 	LatencyMs  float64   `json:"latencyMs"`
 	Hops       []Hop     `json:"hops"`
 	Reason     string    `json:"reason"`
+	// EntryAgeSec is the age of the cache entry that was found (0 on a miss).
+	EntryAgeSec float64 `json:"entryAgeSec"`
+	TTLSec      int     `json:"ttlSec"`
+	// HappyPath is what this read would have returned had the pending
+	// invalidation been delivered first (invalidation strategy, HappyPath on).
+	HappyPath *HappyPath `json:"happyPath,omitempty"`
+}
+
+// HappyPath is the result of the same check on the happy path: the
+// invalidation was delivered before the read.
+type HappyPath struct {
+	Decision  string  `json:"decision"`
+	Correct   bool    `json:"correct"`
+	ServedBy  string  `json:"servedBy"`
+	LatencyMs float64 `json:"latencyMs"`
+	Hops      []Hop   `json:"hops"`
+	Note      string  `json:"note"`
 }
 
 func decision(ok bool) string {
@@ -279,7 +371,7 @@ func (d *Demo) Check(subject, object string) (CheckResult, error) {
 	if err != nil {
 		return CheckResult{}, err
 	}
-	r := CheckResult{ID: fmt.Sprintf("c%d", d.seq), Strategy: d.Strategy, Subject: subject, Object: object, Expected: decision(truth), PrimaryRev: d.Store.Rev(), QueueDepth: d.Queue.Depth()}
+	r := CheckResult{ID: fmt.Sprintf("c%d", d.seq), Strategy: d.Strategy, Subject: subject, Object: object, Expected: decision(truth), PrimaryRev: d.Store.Rev(), QueueDepth: d.Queue.Depth(), TTLSec: CacheTTLSec}
 	if m, pos, ok := d.Queue.Pending(subject, object); ok {
 		r.Pending, r.PendingPos = &m, pos
 	}
@@ -294,8 +386,15 @@ func (d *Demo) Check(subject, object string) (CheckResult, error) {
 
 	key := cacheKey(subject, object)
 	entry, hit := d.cache[key]
+	expiredNow := false
+	if hit && d.EnforceTTL && d.age(entry) >= CacheTTLSec {
+		// Lazily evict an entry whose TTL ran out since it was cached.
+		delete(d.cache, key)
+		hit, expiredNow = false, true
+	}
 	if hit {
 		r.CacheRev = entry.Rev
+		r.EntryAgeSec = d.age(entry)
 	}
 
 	hop := func(h Hop) { r.Hops = append(r.Hops, h); r.LatencyMs += h.Ms }
@@ -305,6 +404,8 @@ func (d *Demo) Check(subject, object string) (CheckResult, error) {
 		lookup = fmt.Sprintf("hit: %s @ rev %d", entry.Decision, entry.Rev)
 	} else if m, ok := d.invalidated[key]; ok {
 		lookup = fmt.Sprintf("miss (dropped by invalidation #%d)", m.ID)
+	} else if expiredNow || d.expired[key] {
+		lookup = fmt.Sprintf("miss (expired after the %d s TTL)", CacheTTLSec)
 	}
 	hop(Hop{From: "checkapi", To: "cache", Label: "lookup → " + lookup, Ms: CacheHitMs})
 
@@ -324,6 +425,10 @@ func (d *Demo) Check(subject, object string) (CheckResult, error) {
 			r.Reason = fmt.Sprintf("Cache entry rev %d ≥ revision token %d: it already reflects the latest ACL change, so it is safe to serve.", entry.Rev, r.RequiredRev)
 		case r.Pending != nil && entry.Decision != r.Expected:
 			r.Reason = fmt.Sprintf("Read-after-write inconsistency: SQLite committed rev %d, but invalidation #%d is still queued (position %d of %d), so the cache still serves its old entry (rev %d).", r.Pending.Rev, r.Pending.ID, r.PendingPos, r.QueueDepth, entry.Rev)
+		case d.EnforceTTL && entry.Decision != r.Expected:
+			r.Reason = fmt.Sprintf("Stale: the entry was cached %.0f s ago at rev %d; SQLite is now at rev %d. Nothing invalidates it, so it is served until its TTL runs out in %.0f s.", r.EntryAgeSec, entry.Rev, r.PrimaryRev, CacheTTLSec-r.EntryAgeSec)
+		case d.EnforceTTL:
+			r.Reason = fmt.Sprintf("Cache hit: cached %.0f s ago at rev %d, expires in %.0f s (TTL %d s). Served without asking SQLite.", r.EntryAgeSec, entry.Rev, CacheTTLSec-r.EntryAgeSec, CacheTTLSec)
 		default:
 			r.Reason = fmt.Sprintf("Cache hit (computed at rev %d, TTL %d s): served without asking SQLite.", entry.Rev, CacheTTLSec)
 		}
@@ -336,16 +441,22 @@ func (d *Demo) Check(subject, object string) (CheckResult, error) {
 			r.Reason = fmt.Sprintf("Cache entry rev %d < revision token %d: it predates the last ACL change, so the check fell back to SQLite and refreshed the cache.", entry.Rev, r.RequiredRev)
 		case strings.HasPrefix(lookup, "miss (dropped"):
 			r.Reason = "The delivered invalidation removed the old entry, so the check read SQLite and re-cached the fresh decision."
+		case strings.HasPrefix(lookup, "miss (expired"):
+			r.Reason = fmt.Sprintf("The old entry reached its TTL (%d s) and was evicted, so the check read SQLite and re-cached the fresh decision.", CacheTTLSec)
 		default:
 			r.Reason = "Cache miss: evaluated in SQLite and cached."
 		}
 		hop(Hop{From: "checkapi", To: "primary", Label: fmt.Sprintf("SQLite query at rev %d → %s", r.PrimaryRev, r.Decision), Ms: PrimaryMs, Kind: kind})
 		hop(Hop{From: "checkapi", To: "cache", Label: fmt.Sprintf("refresh: %s @ rev %d", r.Decision, r.PrimaryRev), Ms: CacheFillMs})
-		d.cache[key] = CacheEntry{Subject: subject, Object: object, Decision: r.Decision, Rev: r.PrimaryRev}
+		d.cache[key] = CacheEntry{Subject: subject, Object: object, Decision: r.Decision, Rev: r.PrimaryRev, CachedAt: d.clock()}
 		delete(d.invalidated, key)
+		delete(d.expired, key)
 	}
 	r.Correct = r.Decision == r.Expected
 	hop(Hop{From: "checkapi", To: "client", Label: r.Decision, Ms: NetworkMs, Kind: map[bool]string{true: "ok", false: "stale"}[r.Correct]})
+	if d.HappyPath && d.Strategy == Invalidation && r.Pending != nil {
+		r.HappyPath = happyPath(r)
+	}
 
 	d.Audit.Append(audit.Record{
 		ID: r.ID, T: int64(d.seq), Kind: "check", Subject: subject, Permission: "view", Object: object,
@@ -356,6 +467,28 @@ func (d *Demo) Check(subject, object string) (CheckResult, error) {
 	return r, nil
 }
 
+// happyPath is the same check had the pending invalidation been delivered
+// before the read: the entry is gone, so the lookup misses and SQLite answers.
+func happyPath(r CheckResult) *HappyPath {
+	hp := &HappyPath{Decision: r.Expected, Correct: true, ServedBy: "primary"}
+	for _, h := range []Hop{
+		{From: "client", To: "checkapi", Label: fmt.Sprintf("can %s view %s?", r.Subject, r.Object), Ms: NetworkMs},
+		{From: "checkapi", To: "cache", Label: fmt.Sprintf("lookup → miss (dropped by invalidation #%d)", r.Pending.ID), Ms: CacheHitMs},
+		{From: "checkapi", To: "primary", Label: fmt.Sprintf("SQLite query at rev %d → %s", r.PrimaryRev, r.Expected), Ms: PrimaryMs},
+		{From: "checkapi", To: "cache", Label: fmt.Sprintf("refresh: %s @ rev %d", r.Expected, r.PrimaryRev), Ms: CacheFillMs},
+		{From: "checkapi", To: "client", Label: r.Expected, Ms: NetworkMs, Kind: "ok"},
+	} {
+		hp.Hops = append(hp.Hops, h)
+		hp.LatencyMs += h.Ms
+	}
+	if r.Decision == r.Expected {
+		hp.Note = fmt.Sprintf("Same decision as the happy path: invalidation #%d is still queued, but this entry already agrees with SQLite.", r.Pending.ID)
+	} else {
+		hp.Note = fmt.Sprintf("Had invalidation #%d been delivered before this read, the lookup would miss and SQLite would answer %s.", r.Pending.ID, r.Expected)
+	}
+	return hp
+}
+
 type State struct {
 	Strategy   Strategy         `json:"strategy"`
 	PrimaryRev int64            `json:"primaryRev"`
@@ -364,10 +497,14 @@ type State struct {
 	Cache      []CacheEntry     `json:"cache"`
 	Queued     []QueueMsg       `json:"queued"`
 	Delivered  []QueueMsg       `json:"delivered"`
+	TTLSec     int              `json:"ttlSec"`
+	EnforceTTL bool             `json:"enforceTTL"`
+	// ClockSec is the simulated time since the world was created.
+	ClockSec float64 `json:"clockSec"`
 }
 
 func (d *Demo) State() (State, error) {
-	s := State{Strategy: d.Strategy, PrimaryRev: d.Store.Rev(), Tuples: []string{}, Cache: []CacheEntry{}}
+	s := State{Strategy: d.Strategy, PrimaryRev: d.Store.Rev(), Tuples: []string{}, Cache: []CacheEntry{}, TTLSec: CacheTTLSec, EnforceTTL: d.EnforceTTL, ClockSec: d.ClockSec()}
 	s.Delivered, s.Queued = d.Queue.Snapshot()
 	tuples, err := d.Store.Tuples()
 	if err != nil {
@@ -380,6 +517,8 @@ func (d *Demo) State() (State, error) {
 		return s, err
 	}
 	for _, e := range d.cache {
+		e.AgeSec = d.age(e)
+		e.ExpiresInSec = max(0, CacheTTLSec-e.AgeSec)
 		s.Cache = append(s.Cache, e)
 	}
 	sort.Slice(s.Cache, func(i, j int) bool {

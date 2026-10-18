@@ -110,3 +110,52 @@ func TestHopsAreNeverNull(t *testing.T) {
 		}
 	}
 }
+
+func TestStrategyStoriesFlag(t *testing.T) {
+	on := serve(t, features.Flags{StrategyStories: true})
+	off := serve(t, features.Flags{StrategyStories: false})
+
+	if code, _ := call(t, off, "POST", "/api/v1/clock/advance", `{"seconds":300}`); code != http.StatusNotFound {
+		t.Errorf("flag off: POST /api/v1/clock/advance = %d, want 404", code)
+	}
+
+	// Flag on: the TTL story ends when the entry expires.
+	alice := `{"subject":"user:alice","object":"doc:42"}`
+	call(t, on, "POST", "/api/v1/strategy", `{"strategy":"ttl"}`)
+	call(t, on, "POST", "/api/v1/check", alice)
+	call(t, on, "POST", "/api/v1/revoke", alice)
+	if _, r := call(t, on, "POST", "/api/v1/check", alice); r["decision"] != "ALLOW" || r["servedBy"] != "cache" {
+		t.Errorf("read within the TTL = %v via %v, want a stale ALLOW from the cache", r["decision"], r["servedBy"])
+	}
+	if _, st := call(t, on, "GET", "/api/v1/state", ""); st["ttlSec"] != float64(300) || st["enforceTTL"] != true {
+		t.Errorf("state should report the TTL config, got ttlSec=%v enforceTTL=%v", st["ttlSec"], st["enforceTTL"])
+	}
+	code, adv := call(t, on, "POST", "/api/v1/clock/advance", `{"seconds":300}`)
+	if code != http.StatusOK || len(adv["evicted"].([]any)) != 1 {
+		t.Fatalf("advance: %d %v, want one evicted entry", code, adv)
+	}
+	if _, r := call(t, on, "POST", "/api/v1/check", alice); r["decision"] != "DENY" || r["servedBy"] != "primary" {
+		t.Errorf("read after the TTL = %v via %v, want DENY from SQLite", r["decision"], r["servedBy"])
+	}
+	if code, _ := call(t, on, "POST", "/api/v1/clock/advance", `{"seconds":0}`); code != http.StatusBadRequest {
+		t.Errorf("advance by 0 s = %d, want 400", code)
+	}
+}
+
+func TestHappyPathComparisonFlag(t *testing.T) {
+	alice := `{"subject":"user:alice","object":"doc:42"}`
+	for _, enabled := range []bool{true, false} {
+		srv := serve(t, features.Flags{ControlledCacheDelivery: true, HappyPathComparison: enabled})
+		call(t, srv, "POST", "/api/v1/strategy", `{"strategy":"invalidation"}`)
+		call(t, srv, "POST", "/api/v1/check", alice)
+		call(t, srv, "POST", "/api/v1/revoke", alice)
+		_, r := call(t, srv, "POST", "/api/v1/check", alice)
+		hp, ok := r["happyPath"].(map[string]any)
+		if ok != enabled {
+			t.Fatalf("flag %v: happyPath present = %v", enabled, ok)
+		}
+		if enabled && (r["decision"] != "ALLOW" || hp["decision"] != "DENY") {
+			t.Errorf("read before delivery = %v with happy path %v, want ALLOW next to DENY", r["decision"], hp["decision"])
+		}
+	}
+}

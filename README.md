@@ -27,15 +27,21 @@ Permission checks are cached for speed. When an admin revokes access in SQLite, 
 
 ## Interactive demonstration
 
-The same five-step story runs under the strategy you pick. **Invalidation events are delivered only when you click**, so every run is deterministic:
+Each strategy has its own story (flag `FEATURE_STRATEGY_STORIES`). Every run is deterministic: **invalidation events are delivered only when you click**, and TTL expiry runs on a simulated clock that you fast-forward.
 
-1. **Alice opens doc:42**: cache miss → SQLite → ALLOW cached at rev 3.
-2. **Admin revokes Alice**: committed in SQLite at rev 4. With the invalidation strategy, event #1 is queued.
-3. **Alice reads before delivery**: the event is still in the queue.
-4. **Deliver the invalidation event**: manual; delivers the head of the queue to the cache.
-5. **Alice reads after delivery**.
+| Step | TTL cache | TTL + invalidation | Revision-aware |
+|---|---|---|---|
+| 1 | Alice opens doc:42: cache miss → SQLite → ALLOW cached at rev 3 | same | same |
+| 2 | Admin revokes Alice (SQLite rev 4); nothing tells the cache | Admin revokes Alice; invalidation #1 is queued | Admin revokes Alice; doc:42's revision token becomes 4 |
+| 3 | **Alice reads within the TTL** (repeatable): stale ALLOW; the freshness panel shows the entry's age and time left | **Check before delivery** (repeatable, also as Bob): each read shows its result **next to the happy path** (event delivered first) | Alice reads after the revoke: fallback to SQLite, DENY |
+| 4 | **Fast-forward 300 s**: the entry reaches its TTL and is evicted | **Deliver the invalidation event** (manual) | Alice reads again: fresh cache hit |
+| 5 | Alice reads after the TTL: DENY from SQLite | Alice reads after delivery: DENY from SQLite | |
 
-The data-flow diagram replays every request hop by hop, **with the latency of each hop**. It includes the invalidation queue node, which lists the queued events and has a **Deliver next invalidation** button.
+The TTL story has no delivery step, because the TTL strategy sends no invalidations. Instead, the **Cache TTL and freshness** panel shows the TTL config (300 s), the simulated clock and, for every cache entry, the revision it was cached at, SQLite's current revision for the document, its age, the time left before it expires, and whether it is fresh or stale.
+
+With the invalidation strategy, a read made while the user's invalidation is still queued puts **this read** (stale ALLOW from the cache, 1.2 ms) next to **the happy path** (the event delivered before the read: DENY from SQLite, 16.3 ms), so the incorrect and the correct result are visible side by side (flag `FEATURE_HAPPY_PATH_COMPARISON`).
+
+The data-flow diagram replays every request hop by hop, **with the latency of each hop**. It includes the invalidation queue node, which lists the queued events and, for the invalidation strategy, has a **Deliver next invalidation** button.
 
 ![Invalidation strategy, step 3: event #1 still queued, stale ALLOW served from the cache](docs/images/showcase-race.png)
 
@@ -43,9 +49,9 @@ The page also runs the story for all three strategies side by side:
 
 ![Same story, all three strategies](docs/images/showcase-compare.png)
 
-| Strategy | Read before delivery | Read after delivery | Verdict |
+| Strategy | Read before delivery | Read after delivery / TTL expiry | Verdict |
 |---|---|---|---|
-| TTL cache | ✕ ALLOW (cache, 1.2 ms) | ✕ ALLOW (cache, 1.2 ms) | stale until TTL |
+| TTL cache | ✕ ALLOW (cache, 1.2 ms) | ✓ DENY (SQLite after the TTL, 16.3 ms) | stale until TTL |
 | TTL + invalidation | ✕ ALLOW (cache, 1.2 ms) | ✓ DENY (SQLite, 16.3 ms) | stale until the event is delivered |
 | Revision-aware | ✓ DENY (SQLite fallback, 16.3 ms) | ✓ DENY (cache, 1.2 ms) | always fresh |
 
@@ -68,13 +74,16 @@ A separate world (always the invalidation strategy) where you control the delive
 
 **Run correctness tests** on the page executes `demo.RunSuite()` on the server. CI runs the same code via `go test ./internal/demo`.
 
-![Correctness tests: 9/9 passed](docs/images/showcase-tests.png)
+![Correctness tests: all passed](docs/images/showcase-tests.png)
 
 | Test | Strategy | What it proves |
 |---|---|---|
 | TTL cache serves a stale ALLOW until the TTL expires | TTL | the problem is real (passes when reproduced) |
+| The stale window ends when the entry's TTL runs out | TTL | stale within the TTL, fresh after fast-forwarding 300 s |
+| An entry is served until exactly its TTL | TTL | frozen clock: still served at 299 s, evicted at 300 s |
 | A read right after the write is stale while the event is queued | Invalidation | read-after-write inconsistency |
 | Delivering the event fixes the cache | Invalidation | it mitigates |
+| A read before delivery reports the happy-path result next to its own | Invalidation | stale ALLOW alongside the happy-path DENY; nothing to compare after delivery |
 | A queue backlog stretches the inconsistency | Invalidation | stale through 3 deliveries, fresh only after her own |
 | Revision-aware is correct before any delivery | Revision-aware | no invalidation needed |
 | Revision-aware pays the fallback once, then hits the cache again | Revision-aware | the cost is bounded |
@@ -101,6 +110,8 @@ Every feature ships behind a flag; see **[docs/FEATURES.md](docs/FEATURES.md)** 
 | Flag | Default | Feature |
 |---|---|---|
 | `FEATURE_CONTROLLED_CACHE_DELIVERY` | `true` | Invalidation events wait in the queue until delivered from the UI (deliver step, queue button, section 3 simulation). Off: delivered automatically after each commit. |
+| `FEATURE_STRATEGY_STORIES` | `true` | Each strategy gets its own story. TTL: no delivery step; entries expire on a simulated clock, with a TTL and freshness panel and a fast-forward step. Off: one shared story for all strategies. |
+| `FEATURE_HAPPY_PATH_COMPARISON` | `true` | An invalidation read made while its event is queued also returns the happy-path result, shown side by side. Off: only the read's own result. |
 | `FEATURE_AUTH` | `false` | *Planned*: authentication and user management (see [TODO.md](TODO.md)). |
 
 ## Run locally
@@ -121,11 +132,12 @@ All endpoints accept an `X-Lab-Session` header. Each session has two worlds, eac
 | Endpoint | Purpose |
 |---|---|
 | `GET /api/v1/features` | active feature flags (see [docs/FEATURES.md](docs/FEATURES.md)) |
-| `GET /api/v1/state` | strategy, SQLite revision, tuples, revision tokens, cache entries, queued + recently delivered invalidations |
+| `GET /api/v1/state` | strategy, SQLite revision, tuples, revision tokens, cache entries (with age and time left), TTL config, simulated clock, queued + recently delivered invalidations |
 | `POST /api/v1/strategy {strategy: "ttl" \| "invalidation" \| "revision_aware"}` | switch strategy (starts a fresh world) |
-| `POST /api/v1/check {subject, object}` | check `view`. Returns decision, SQLite's answer, served-by, revisions, the user's queued invalidation (position in queue) and **hops with per-hop latency** |
+| `POST /api/v1/check {subject, object}` | check `view`. Returns decision, SQLite's answer, served-by, revisions, the user's queued invalidation (position in queue), the entry's age, **hops with per-hop latency** and, while the invalidation is queued, the `happyPath` result (flag `FEATURE_HAPPY_PATH_COMPARISON`) |
 | `POST /api/v1/grant` · `POST /api/v1/revoke {subject, object}` | change access in SQLite (queues an invalidation event under the invalidation strategy) |
 | `POST /api/v1/deliver` | deliver the invalidation event at the head of the queue (flag `FEATURE_CONTROLLED_CACHE_DELIVERY`) |
+| `POST /api/v1/clock/advance {seconds}` | fast-forward the simulated clock 1–3600 s; entries that reach the TTL are evicted (flag `FEATURE_STRATEGY_STORIES`) |
 | `GET /api/v1/compare` | run the five-step story under every strategy |
 | `POST /api/v1/reset` | restore the starting state |
 | `GET /api/v1/audit?stale=true` | audit log of writes and checks |

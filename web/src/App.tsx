@@ -1,20 +1,30 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "./api";
-import type { CheckResult, CompareRow, DeliverResult, Features, Hop, State, Strategy, WriteResult } from "./types";
+import type { CheckResult, ClockResult, CompareRow, DeliverResult, Features, Hop, State, Strategy, WriteResult } from "./types";
+import { CacheFreshness } from "./components/CacheFreshness";
 import { FlowDiagram, fmtMs, hopMs, shortLabel } from "./components/FlowDiagram";
 import { QueueSimulation } from "./components/QueueSimulation";
 import { TestsPanel } from "./components/TestsPanel";
 import { STRATEGIES, byId } from "./strategies";
 
-type Entry = { kind: "check"; r: CheckResult } | { kind: "write"; r: WriteResult } | { kind: "deliver"; r: DeliverResult };
+type Entry = { kind: "check"; r: CheckResult } | { kind: "write"; r: WriteResult } | { kind: "deliver"; r: DeliverResult } | { kind: "clock"; r: ClockResult };
 
 interface Actions {
   check: (subject: string, object: string) => Promise<boolean>;
   write: (op: "grant" | "revoke", subject: string, object: string) => Promise<boolean>;
   deliver: () => Promise<boolean>;
+  advance: (seconds: number) => Promise<boolean>;
 }
 
-type StepDef = { title: string; hint: string; run: (a: Actions) => Promise<boolean> };
+type StepDef = {
+  title: string;
+  hint: string;
+  run: (a: Actions) => Promise<boolean>;
+  // A repeatable step stays clickable until the step after it is done.
+  repeatable?: boolean;
+  // Extra actions shown next to the step while it is clickable.
+  alts?: { label: string; run: (a: Actions) => Promise<boolean> }[];
+};
 
 // With controlled cache delivery the story pauses so the reviewer delivers the
 // invalidation event; without it, events are delivered right after the commit.
@@ -30,6 +40,42 @@ const AUTO_STEPS: StepDef[] = [
   { title: "Admin revokes Alice", hint: "SQLite commits the revoke. Invalidation strategy: the event is delivered right away.", run: (a) => a.write("revoke", "user:alice", "doc:42") },
   { title: "Alice reads again", hint: "Is the cache fresh?", run: (a) => a.check("user:alice", "doc:42") },
 ];
+
+// Strategy stories (FEATURE_STRATEGY_STORIES): each strategy gets only the
+// steps that make sense for it. TTL sends no invalidations, so instead of a
+// delivery step the clock is fast-forwarded past the TTL.
+const TTL_SEC = 300;
+const STORIES: Record<Strategy, (controlled: boolean) => StepDef[]> = {
+  ttl: () => [
+    { title: "Alice opens doc:42", hint: `Cache miss → SQLite → ALLOW is cached with a ${TTL_SEC} s TTL.`, run: (a) => a.check("user:alice", "doc:42") },
+    { title: "Admin revokes Alice", hint: "SQLite commits the revoke. Nothing tells the cache.", run: (a) => a.write("revoke", "user:alice", "doc:42") },
+    { title: "Alice reads within the TTL", hint: "The entry hasn't expired yet. Watch its age and time left below.", run: (a) => a.check("user:alice", "doc:42"), repeatable: true },
+    { title: `Fast-forward ${TTL_SEC} s`, hint: "Skip the simulated clock to the end of the TTL.", run: (a) => a.advance(TTL_SEC) },
+    { title: "Alice reads after the TTL", hint: "The entry expired, so SQLite answers.", run: (a) => a.check("user:alice", "doc:42") },
+  ],
+  invalidation: (controlled) =>
+    controlled
+      ? [
+          { title: "Alice opens doc:42", hint: "Cache miss → SQLite → ALLOW is cached.", run: (a) => a.check("user:alice", "doc:42") },
+          { title: "Admin revokes Alice", hint: "SQLite commits the revoke; its invalidation event is queued.", run: (a) => a.write("revoke", "user:alice", "doc:42") },
+          {
+            title: "Check before delivery",
+            hint: "Check as often as you like while the event is queued: each read shows what it got next to the happy path.",
+            run: (a) => a.check("user:alice", "doc:42"),
+            repeatable: true,
+            alts: [{ label: "Bob reads doc:42", run: (a) => a.check("user:bob", "doc:42") }],
+          },
+          { title: "Deliver the invalidation event", hint: "Manual: delivers the head of the queue to the cache.", run: (a) => a.deliver() },
+          { title: "Alice reads after delivery", hint: "The entry is gone, so SQLite answers.", run: (a) => a.check("user:alice", "doc:42") },
+        ]
+      : AUTO_STEPS,
+  revision_aware: () => [
+    { title: "Alice opens doc:42", hint: "Cache miss → SQLite → ALLOW is cached, stamped with its revision.", run: (a) => a.check("user:alice", "doc:42") },
+    { title: "Admin revokes Alice", hint: "SQLite commits the revoke; doc:42's revision token moves forward.", run: (a) => a.write("revoke", "user:alice", "doc:42") },
+    { title: "Alice reads after the revoke", hint: "The entry is older than the token: fallback to SQLite.", run: (a) => a.check("user:alice", "doc:42") },
+    { title: "Alice reads again", hint: "The refreshed entry matches the token: a fast, correct hit.", run: (a) => a.check("user:alice", "doc:42") },
+  ],
+};
 
 // Latency of each path through the system (sum of the modelled hops).
 const PATHS = [
@@ -47,7 +93,7 @@ function pathOf(r: CheckResult): string {
 
 export default function App() {
   const [state, setState] = useState<State | null>(null);
-  const [flags, setFlags] = useState<Features>({ controlledCacheDelivery: true });
+  const [flags, setFlags] = useState<Features>({ controlledCacheDelivery: true, strategyStories: true, happyPathComparison: true });
   const [step, setStep] = useState(0);
   const [log, setLog] = useState<Entry[]>([]);
   const [hops, setHops] = useState<Hop[]>([]);
@@ -110,15 +156,26 @@ export default function App() {
         push({ kind: "deliver", r });
         setHops(r.hops ?? []);
       }),
+    advance: (seconds) =>
+      act(async () => {
+        const r = await api.advanceClock(seconds);
+        push({ kind: "clock", r });
+        setHops(r.hops ?? []);
+      }),
   };
 
   const controlled = flags.controlledCacheDelivery;
-  const STEPS = controlled ? CONTROLLED_STEPS : AUTO_STEPS;
+  const stories = flags.strategyStories;
+  const strategy = state?.strategy ?? "ttl";
+  const STEPS = stories ? STORIES[strategy](controlled) : controlled ? CONTROLLED_STEPS : AUTO_STEPS;
+  // Manual delivery only makes sense for the strategy that has a queue.
+  const canDeliver = controlled && (!stories || strategy === "invalidation");
 
-  async function runStep(i: number) {
+  async function runStep(run: StepDef["run"], i: number) {
     // Only advance when the step's action succeeded, so the story can't drift
     // out of sync with the server (e.g. revoking an already-revoked user).
-    if (await STEPS[i].run(actions)) setStep(i + 1);
+    // Repeating a step never moves the story backwards.
+    if (await run(actions)) setStep((s) => Math.max(s, i + 1));
   }
 
   const switchTo = (s: Strategy) =>
@@ -129,7 +186,6 @@ export default function App() {
       setHops([]);
     });
 
-  const strategy = state?.strategy ?? "ttl";
   const lastEntry = log[0];
   const lastCheck = lastEntry?.kind === "check" ? lastEntry.r : undefined;
 
@@ -202,18 +258,29 @@ export default function App() {
         </div>
 
         <ol className="steps">
-          {STEPS.map((s, i) => (
-            <li key={s.title} className={i < step ? "done" : ""}>
-              <button className={i === step ? "primary-btn" : ""} disabled={busy || i > step} onClick={() => runStep(i)}>
-                <span className="step-n">{i < step ? "✓" : i + 1}</span> {s.title}
-              </button>
-              <span className="muted small">{s.hint}</span>
-            </li>
-          ))}
+          {STEPS.map((s, i) => {
+            const open = i === step || (s.repeatable && step === i + 1);
+            return (
+              <li key={s.title} className={i < step ? "done" : ""}>
+                <button className={i === step ? "primary-btn" : ""} disabled={busy || !open} onClick={() => runStep(s.run, i)}>
+                  <span className="step-n">{i < step ? "✓" : i + 1}</span> {s.title}
+                  {s.repeatable && i < step && open && " (again)"}
+                </button>
+                {s.alts?.map((alt) => (
+                  <button key={alt.label} className="alt-btn" disabled={busy || !open} onClick={() => runStep(alt.run, i)}>
+                    {alt.label}
+                  </button>
+                ))}
+                <span className="muted small">{s.hint}</span>
+              </li>
+            );
+          })}
         </ol>
         {error && <p className="txt-bad">{error}</p>}
 
-        <FlowDiagram hops={hops} state={state} actor={actor} onDeliver={controlled ? actions.deliver : undefined} busy={busy} />
+        <FlowDiagram hops={hops} state={state} actor={actor} onDeliver={canDeliver ? actions.deliver : undefined} busy={busy} />
+
+        {stories && state?.enforceTTL && <CacheFreshness state={state} highlight={strategy === "ttl"} />}
 
         {lastEntry && (
           <div className="result-row">
@@ -228,9 +295,11 @@ export default function App() {
                 </div>
                 <p>{lastEntry.r.reason}</p>
                 <p className="mono small">
-                  served by {lastEntry.r.servedBy} · cache entry rev {lastEntry.r.cacheRev || "—"} · revision token {lastEntry.r.requiredRev || "not used"} · SQLite
-                  rev {lastEntry.r.primaryRev} · {fmtMs(lastEntry.r.latencyMs)} ms
+                  served by {lastEntry.r.servedBy} · cache entry rev {lastEntry.r.cacheRev || "—"}
+                  {stories && lastEntry.r.servedBy === "cache" && <> (age {Math.floor(lastEntry.r.entryAgeSec)} s of {lastEntry.r.ttlSec} s TTL)</>} · revision token{" "}
+                  {lastEntry.r.requiredRev || "not used"} · SQLite rev {lastEntry.r.primaryRev} · {fmtMs(lastEntry.r.latencyMs)} ms
                 </p>
+                {lastEntry.r.happyPath && <HappyPathCompare r={lastEntry.r} />}
               </div>
             ) : lastEntry.kind === "write" ? (
               <div className="result neutral" aria-live="polite">
@@ -239,9 +308,14 @@ export default function App() {
                 </div>
                 <p>{lastEntry.r.note}</p>
               </div>
-            ) : (
+            ) : lastEntry.kind === "deliver" ? (
               <div className="result neutral" aria-live="polite">
                 <div className="decision">{lastEntry.r.delivered ? `Delivered invalidation #${lastEntry.r.message?.id}` : "Nothing to deliver"}</div>
+                <p>{lastEntry.r.note}</p>
+              </div>
+            ) : (
+              <div className="result neutral" aria-live="polite">
+                <div className="decision">Fast-forwarded {lastEntry.r.advancedSec} s</div>
                 <p>{lastEntry.r.note}</p>
               </div>
             )}
@@ -315,7 +389,7 @@ export default function App() {
                 <tr>
                   <th scope="col">strategy</th>
                   <th scope="col">{controlled ? "read before delivery" : "read after revoke"}</th>
-                  <th scope="col">{controlled ? "read after delivery" : "read again"}</th>
+                  <th scope="col">{stories ? "read after delivery / TTL expiry" : controlled ? "read after delivery" : "read again"}</th>
                   <th scope="col">verdict</th>
                 </tr>
               </thead>
@@ -328,7 +402,7 @@ export default function App() {
                         {c.correct ? "✓" : "✕"} {c.decision} <span className="muted mono small">({c.servedBy}, {fmtMs(c.latencyMs)} ms)</span>
                       </td>
                     ))}
-                    <td>{r.before.correct && r.after.correct ? "always fresh" : r.after.correct ? "stale until the event is delivered" : "stale until TTL"}</td>
+                    <td>{r.before.correct && r.after.correct ? "always fresh" : r.strategy === "ttl" || !r.after.correct ? "stale until TTL" : "stale until the event is delivered"}</td>
                   </tr>
                 ))}
               </tbody>
@@ -357,9 +431,14 @@ export default function App() {
             <button disabled={busy} onClick={() => actions.write("revoke", user, doc)}>
               Revoke viewer
             </button>
-            {controlled && (
+            {canDeliver && (
               <button disabled={busy} onClick={actions.deliver}>
                 Deliver next invalidation
+              </button>
+            )}
+            {stories && (
+              <button disabled={busy} onClick={() => actions.advance(60)}>
+                Fast-forward 60 s
               </button>
             )}
           </div>
@@ -382,8 +461,10 @@ export default function App() {
                       ✎ {e.r.op} {e.r.tuple} → rev {e.r.rev}
                       {e.r.message && <> · queued invalidation #{e.r.message.id}</>}
                     </>
-                  ) : (
+                  ) : e.kind === "deliver" ? (
                     <>▶ {e.r.note}</>
+                  ) : (
+                    <>⏩ {e.r.note}</>
                   )}
                 </li>
               ))}
@@ -397,6 +478,37 @@ export default function App() {
       <TestsPanel section={controlled ? 4 : 3} />
 
       <footer className="muted small">Mock system with modelled latencies, backed by an in-memory SQLite store per browser session. {controlled ? "Invalidation events are delivered only when you click." : "Invalidation events are delivered automatically after each commit."}</footer>
+    </div>
+  );
+}
+
+// HappyPathCompare puts a read made while its invalidation is still queued
+// next to the same read on the happy path (event delivered first).
+function HappyPathCompare({ r }: { r: CheckResult }) {
+  const hp = r.happyPath!;
+  return (
+    <div className="happy-compare">
+      <div className={`happy-col ${r.correct ? "ok" : "bad"}`}>
+        <div className="small muted">This read: invalidation #{r.pending?.id} still queued</div>
+        <div className="decision">
+          <strong>{r.decision}</strong>
+          <span className={`badge ${r.correct ? "ok" : "bad"}`}>{r.correct ? "✓ correct" : "✕ incorrect"}</span>
+        </div>
+        <div className="mono small">
+          served by {r.servedBy} · {fmtMs(r.latencyMs)} ms
+        </div>
+      </div>
+      <div className="happy-col ok">
+        <div className="small muted">Happy path: invalidation delivered before the read</div>
+        <div className="decision">
+          <strong>{hp.decision}</strong>
+          <span className="badge ok">✓ correct</span>
+        </div>
+        <div className="mono small">
+          served by SQLite · {fmtMs(hp.latencyMs)} ms
+        </div>
+      </div>
+      <p className="small happy-note">{hp.note}</p>
     </div>
   );
 }
