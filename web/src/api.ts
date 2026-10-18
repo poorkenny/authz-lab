@@ -1,4 +1,4 @@
-import type { CheckResult, Mode, State, SuiteResult, WriteResult } from "./types";
+import type { CheckResult, CompareRow, State, Strategy, SuiteResult, WriteResult } from "./types";
 
 const SESSION_KEY = "authz-lab-session";
 let memorySession = "";
@@ -30,12 +30,15 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
   return data as T;
 }
 
+type Pair = { subject: string; object: string; waitMs?: number };
+
 export const api = {
   state: () => call<State>("GET", "/api/v1/state"),
   reset: () => call<State>("POST", "/api/v1/reset"),
-  setMode: (mode: Mode) => call<State>("POST", "/api/v1/mode", { mode }),
-  check: (subject: string, object: string) => call<CheckResult>("POST", "/api/v1/check", { subject, object }),
-  grant: (subject: string, object: string) => call<WriteResult>("POST", "/api/v1/grant", { subject, object }),
-  revoke: (subject: string, object: string) => call<WriteResult>("POST", "/api/v1/revoke", { subject, object }),
+  setStrategy: (strategy: Strategy) => call<State>("POST", "/api/v1/strategy", { strategy }),
+  check: (p: Pair) => call<CheckResult>("POST", "/api/v1/check", p),
+  grant: (p: Pair) => call<WriteResult>("POST", "/api/v1/grant", p),
+  revoke: (p: Pair) => call<WriteResult>("POST", "/api/v1/revoke", p),
+  compare: () => call<{ rows: CompareRow[] }>("GET", "/api/v1/compare"),
   runTests: () => call<SuiteResult>("POST", "/api/v1/tests/run"),
 };

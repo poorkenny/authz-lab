@@ -1,4 +1,4 @@
-// Package api exposes the stale-cache demo over HTTP. Every request is scoped
+// Package api exposes the strategy showcase over HTTP. Every request is scoped
 // to a reviewer session via the X-Lab-Session header (the UI generates one per
 // browser), so reviewers on a shared instance never see each other's state.
 package api
@@ -57,7 +57,7 @@ func NewServer() *Server {
 			s.mu.Lock()
 			for id, ss := range s.sessions {
 				if time.Since(ss.lastUsed) > sessionTTL {
-					delete(s.sessions, id)
+					s.drop(id)
 				}
 			}
 			s.mu.Unlock()
@@ -66,12 +66,12 @@ func NewServer() *Server {
 	return s
 }
 
-func (s *Server) session(id string) *session {
+func (s *Server) session(id string) (*session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if ss, ok := s.sessions[id]; ok {
 		ss.lastUsed = time.Now()
-		return ss
+		return ss, nil
 	}
 	if len(s.sessions) >= maxSessions {
 		var oldestID string
@@ -81,11 +81,26 @@ func (s *Server) session(id string) *session {
 				oldestID, oldest = k, v.lastUsed
 			}
 		}
-		delete(s.sessions, oldestID)
+		s.drop(oldestID)
 	}
-	ss := &session{demo: demo.New(demo.PlainCache), lastUsed: time.Now(), tokens: rateBurst, tokensAt: time.Now()}
+	d, err := demo.New(demo.TTL)
+	if err != nil {
+		return nil, err
+	}
+	ss := &session{demo: d, lastUsed: time.Now(), tokens: rateBurst, tokensAt: time.Now()}
 	s.sessions[id] = ss
-	return ss
+	return ss, nil
+}
+
+// drop removes a session and closes its SQLite database. Callers hold s.mu.
+func (s *Server) drop(id string) {
+	ss := s.sessions[id]
+	delete(s.sessions, id)
+	go func() {
+		ss.mu.Lock()
+		defer ss.mu.Unlock()
+		ss.demo.Close()
+	}()
 }
 
 func (s *Server) Routes(mux *http.ServeMux) {
@@ -96,40 +111,55 @@ func (s *Server) Routes(mux *http.ServeMux) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "sessions": n})
 	})
 	mux.HandleFunc("GET /api/v1/state", s.with(func(r *http.Request, d **demo.Demo) (any, error) {
-		return (*d).State(), nil
+		return (*d).State()
 	}))
 	mux.HandleFunc("POST /api/v1/reset", s.with(func(r *http.Request, d **demo.Demo) (any, error) {
-		*d = demo.New((*d).Mode)
-		return (*d).State(), nil
+		return reset(d, (*d).Strategy)
 	}))
-	mux.HandleFunc("POST /api/v1/mode", s.with(func(r *http.Request, d **demo.Demo) (any, error) {
+	mux.HandleFunc("POST /api/v1/strategy", s.with(func(r *http.Request, d **demo.Demo) (any, error) {
 		var req struct {
-			Mode string `json:"mode"`
+			Strategy string `json:"strategy"`
 		}
 		if err := decode(r, &req); err != nil {
 			return nil, err
 		}
-		m, err := demo.ParseMode(req.Mode)
+		st, err := demo.ParseStrategy(req.Strategy)
 		if err != nil {
 			return nil, badRequest(err)
 		}
-		(*d).Mode = m
-		return (*d).State(), nil
+		// A strategy change starts a fresh world so runs are comparable.
+		return reset(d, st)
 	}))
 	mux.HandleFunc("POST /api/v1/grant", s.with(func(r *http.Request, d **demo.Demo) (any, error) {
-		return withPair(r, (*d).Grant)
+		return withPair(r, *d, (*d).Grant)
 	}))
 	mux.HandleFunc("POST /api/v1/revoke", s.with(func(r *http.Request, d **demo.Demo) (any, error) {
-		return withPair(r, (*d).Revoke)
+		return withPair(r, *d, (*d).Revoke)
 	}))
 	mux.HandleFunc("POST /api/v1/check", s.with(func(r *http.Request, d **demo.Demo) (any, error) {
-		return withPair(r, (*d).Check)
+		return withPair(r, *d, (*d).Check)
 	}))
 	mux.HandleFunc("GET /api/v1/audit", s.with(func(r *http.Request, d **demo.Demo) (any, error) {
 		return map[string]any{"records": (*d).Audit.Query(audit.Filter{Limit: 200, StaleOnly: r.URL.Query().Get("stale") == "true"})}, nil
 	}))
+	mux.HandleFunc("GET /api/v1/compare", s.with(func(r *http.Request, _ **demo.Demo) (any, error) {
+		type row struct {
+			Strategy demo.Strategy    `json:"strategy"`
+			Soon     demo.CheckResult `json:"soon"`
+			Later    demo.CheckResult `json:"later"`
+		}
+		var rows []row
+		for _, st := range demo.Strategies {
+			soon, later, err := demo.Story(st)
+			if err != nil {
+				return nil, err
+			}
+			rows = append(rows, row{st, soon, later})
+		}
+		return map[string]any{"rows": rows}, nil
+	}))
 	mux.HandleFunc("POST /api/v1/tests/run", s.with(func(r *http.Request, _ **demo.Demo) (any, error) {
-		return demo.RunSuite(), nil
+		return demo.RunSuite()
 	}))
 }
 
@@ -153,7 +183,11 @@ func (s *Server) with(h func(r *http.Request, d **demo.Demo) (any, error)) http.
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid " + sessionHdr})
 			return
 		}
-		ss := s.session(id)
+		ss, err := s.session(id)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxBody)
 		ss.mu.Lock()
 		defer ss.mu.Unlock()
@@ -175,14 +209,31 @@ func (s *Server) with(h func(r *http.Request, d **demo.Demo) (any, error)) http.
 	}
 }
 
-func withPair[T any](r *http.Request, f func(subject, object string) (T, error)) (any, error) {
+func reset(d **demo.Demo, st demo.Strategy) (any, error) {
+	fresh, err := demo.New(st)
+	if err != nil {
+		return nil, err
+	}
+	(*d).Close()
+	*d = fresh
+	return fresh.State()
+}
+
+// withPair decodes {subject, object, waitMs}, advances the simulated clock by
+// waitMs, then runs f.
+func withPair[T any](r *http.Request, d *demo.Demo, f func(subject, object string) (T, error)) (any, error) {
 	var req struct {
 		Subject string `json:"subject"`
 		Object  string `json:"object"`
+		WaitMs  int64  `json:"waitMs"`
 	}
 	if err := decode(r, &req); err != nil {
 		return nil, err
 	}
+	if req.WaitMs < 0 || req.WaitMs > 3_600_000 {
+		return nil, badRequest(errors.New("waitMs must be between 0 and 3600000"))
+	}
+	d.Advance(req.WaitMs)
 	out, err := f(req.Subject, req.Object)
 	if err != nil {
 		return nil, badRequest(err)

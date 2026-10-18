@@ -1,18 +1,26 @@
 // Mirrors the Go types in internal/demo.
 
-export type Mode = "plain" | "revision_aware";
+export type Strategy = "ttl" | "invalidation" | "revision_aware";
 
 export interface Hop {
   from: string;
   to: string;
   label: string;
   ms: number;
-  kind?: "ok" | "stale" | "fallback" | "lost";
+  kind?: "ok" | "stale" | "fallback" | "async" | "none";
+}
+
+export interface InvalidationMsg {
+  object: string;
+  rev: number;
+  sentAt: number;
+  deliverAt: number;
 }
 
 export interface CheckResult {
   id: string;
-  mode: Mode;
+  t: number;
+  strategy: Strategy;
   subject: string;
   object: string;
   decision: "ALLOW" | "DENY";
@@ -22,12 +30,15 @@ export interface CheckResult {
   cacheRev: number;
   requiredRev: number;
   primaryRev: number;
+  raceWindow: boolean;
+  invalidation?: InvalidationMsg;
   latencyMs: number;
   hops: Hop[];
   reason: string;
 }
 
 export interface WriteResult {
+  t: number;
   op: "touch" | "delete";
   tuple: string;
   rev: number;
@@ -41,29 +52,40 @@ export interface CacheEntry {
   object: string;
   decision: "ALLOW" | "DENY";
   rev: number;
-  ttlSec: number;
+  cachedAt: number;
+  expiresAt: number;
 }
 
 export interface State {
-  mode: Mode;
+  strategy: Strategy;
+  now: number;
   primaryRev: number;
   tuples: string[];
   docRev: Record<string, number>;
   cache: CacheEntry[];
+  pending: InvalidationMsg[];
+}
+
+export interface CompareRow {
+  strategy: Strategy;
+  soon: CheckResult;
+  later: CheckResult;
 }
 
 export interface TestCase {
   name: string;
   kind: "scenario" | "property";
+  strategy?: Strategy;
   description: string;
   passed: boolean;
   details: string[];
 }
 
-export interface ModeStats {
+export interface StrategyStats {
   checks: number;
   wrong: number;
   staleAllows: number;
+  inWindow: number;
   cacheHits: number;
   fallbacks: number;
   meanMs: number;
@@ -73,6 +95,6 @@ export interface ModeStats {
 export interface SuiteResult {
   passed: boolean;
   cases: TestCase[];
-  property: { seeds: number; opsPerRun: number; writes: number; plain: ModeStats; revisionAware: ModeStats };
+  property: { seeds: number; opsPerRun: number; writes: number; byStrategy: Record<Strategy, StrategyStats> };
   durationMs: number;
 }

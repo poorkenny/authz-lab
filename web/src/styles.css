@@ -118,8 +118,8 @@ footer { text-align: center; margin-top: 24px; }
 .edge.used.k-fallback { stroke: var(--warn); }
 .edge.used.k-stale { stroke: var(--critical); }
 .edge.active { stroke-width: 5; }
-.edge.lost { stroke: var(--critical); stroke-dasharray: 6 5; stroke-width: 2.5; }
-.lost-x { fill: var(--critical); font-size: 20px; font-weight: 700; }
+
+
 .box rect { fill: var(--surface); stroke: var(--axis); stroke-width: 1.5; }
 .box.involved rect { stroke: var(--accent); stroke-width: 2.2; }
 .box-title { fill: var(--ink); font-size: 15px; font-weight: 650; }
@@ -128,7 +128,7 @@ footer { text-align: center; margin-top: 24px; }
 .box-sub.stale-entry { fill: var(--critical-ink); font-weight: 700; }
 .hop-label { fill: var(--ink); font-size: 12px; font-family: var(--mono); paint-order: stroke; stroke: var(--page); stroke-width: 4px; stroke-linejoin: round; }
 .hop-label.k-fallback { fill: var(--warn-ink); font-weight: 700; }
-.hop-label.k-stale, .hop-label.k-lost { fill: var(--critical-ink); font-weight: 700; }
+.hop-label.k-stale { fill: var(--critical-ink); font-weight: 700; }
 .hop-label.k-ok { fill: var(--good-ink); }
 .hop-n { font-weight: 700; }
 .diagram-foot { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; padding: 6px 6px 2px; font-size: 0.9em; color: var(--ink-2); }
@@ -153,7 +153,7 @@ table.data tbody th { font-weight: 500; }
 table.data .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 tr.current th, tr.current td { background: var(--warn-wash); }
 tr.k-fallback td { background: var(--warn-wash); }
-tr.k-stale td, tr.k-lost td { background: var(--critical-wash); }
+tr.k-stale td { background: var(--critical-wash); }
 tr.total-row td { font-weight: 700; border-bottom: none; }
 .table-scroll { overflow-x: auto; }
 .compare { margin-top: 6px; }
@@ -173,5 +173,59 @@ ol.tests li { display: grid; grid-template-columns: 28px 1fr; gap: 8px; padding:
 ol.tests li.bad { border-left-color: var(--critical); }
 .test-icon { font-weight: 700; color: var(--good-ink); font-size: 1.1rem; }
 li.bad .test-icon { color: var(--critical-ink); }
-.tag { font-size: 0.72rem; border: 1px solid var(--border); border-radius: 999px; padding: 0 8px; color: var(--ink-2); vertical-align: 1px; }
+.tag { margin-left: 4px; font-size: 0.72rem; border: 1px solid var(--border); border-radius: 999px; padding: 0 8px; color: var(--ink-2); vertical-align: 1px; }
 .detail { margin-top: 4px; color: var(--ink-2); word-break: break-word; }
+
+/* Showcase framing */
+.eyebrow { font-size: 0.75rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); margin: 0 0 4px; }
+.goal { margin-top: 10px; padding: 12px 16px; border-radius: 10px; background: color-mix(in srgb, var(--accent) 10%, var(--surface)); border-left: 5px solid var(--accent); max-width: 85ch; }
+.strategy-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; margin-top: 12px; }
+.strategy-card { border: 1px solid var(--border); border-top: 5px solid var(--axis); border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 6px; background: var(--surface); }
+.strategy-card.verdict-bad { border-top-color: var(--critical); }
+.strategy-card.verdict-warn { border-top-color: var(--warn); }
+.strategy-card.verdict-ok { border-top-color: var(--good); }
+.strategy-card.selected { box-shadow: 0 0 0 2px var(--accent); }
+.strategy-card header { display: flex; gap: 8px; align-items: center; }
+.strategy-card h3 { margin: 0; font-size: 1rem; }
+.strategy-card p { margin: 0; font-size: 0.92em; }
+.strategy-card button { margin-top: auto; align-self: flex-start; }
+.strategy-n { display: inline-grid; place-items: center; width: 24px; height: 24px; border-radius: 50%; background: var(--surface-2); font-weight: 700; font-size: 0.85em; }
+.strategy-card dl { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; margin: 4px 0; font-size: 0.86em; }
+.strategy-card dt { color: var(--muted); }
+.strategy-card dd { margin: 0; }
+.guarantee { font-weight: 600; padding: 6px 8px; border-radius: 6px; }
+.guarantee.verdict-bad { background: var(--critical-wash); color: var(--critical-ink); }
+.guarantee.verdict-warn { background: var(--warn-wash); color: var(--warn-ink); }
+.guarantee.verdict-ok { background: var(--good-wash); color: var(--good-ink); }
+.badge.warn { border-color: var(--warn); color: var(--warn-ink); }
+.tag.strat-bad { border-color: var(--critical); }
+.tag.strat-warn { border-color: var(--warn); }
+.tag.strat-ok { border-color: var(--good); }
+.row.spread { justify-content: space-between; }
+.row.spread h3 { margin: 0; }
+.compare { margin-top: 18px; }
+.clock { font-weight: 700; color: var(--ink); }
+
+/* Invalidation edge states */
+.edge.async { stroke: var(--warn); stroke-width: 3; stroke-dasharray: 8 6; animation: dash 1s linear infinite; }
+.edge.none-edge { stroke: var(--axis); stroke-dasharray: 4 6; }
+@keyframes dash { to { stroke-dashoffset: -28; } }
+@media (prefers-reduced-motion: reduce) { .edge.async { animation: none; } }
+.hop-label.k-async { fill: var(--warn-ink); font-weight: 700; }
+.hop-label.k-none { fill: var(--muted); }
+tr.k-async td { background: var(--warn-wash); }
+
+/* Race timeline */
+.timeline { margin: 0 0 12px; }
+.timeline svg { display: block; width: 100%; min-width: 640px; height: auto; }
+.timeline .window { fill: var(--warn-wash); }
+.timeline .window-label { fill: var(--warn-ink); font-size: 12.5px; font-weight: 700; }
+.timeline .axis { stroke: var(--axis); stroke-width: 1.5; }
+.timeline .tick-line { stroke: var(--grid); stroke-width: 1; stroke-dasharray: 3 3; }
+.timeline .tick { fill: var(--muted); font-size: 11.5px; font-family: var(--mono); }
+.timeline .tick.strong { fill: var(--ink-2); font-family: var(--font); font-weight: 600; }
+.timeline .row-label { fill: var(--ink); font-size: 13.5px; font-weight: 600; }
+.timeline .mark-ok { fill: var(--good); }
+.timeline .mark-bad { fill: var(--critical); }
+.timeline .mark-icon { fill: #fff; font-size: 11px; font-weight: 700; }
+.timeline .mark-label { fill: var(--ink-2); font-size: 12px; font-family: var(--mono); }
