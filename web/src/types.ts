@@ -5,6 +5,8 @@ export type Strategy = "ttl" | "invalidation" | "revision_aware";
 // Feature flags served by GET /api/v1/features (see docs/FEATURES.md).
 export interface Features {
   controlledCacheDelivery: boolean;
+  strategyStories: boolean;
+  happyPathComparison: boolean;
 }
 
 export interface Hop {
@@ -42,6 +44,27 @@ export interface CheckResult {
   latencyMs: number;
   hops: Hop[];
   reason: string;
+  entryAgeSec: number;
+  ttlSec: number;
+  happyPath?: HappyPath;
+}
+
+// The same check on the happy path: the queued invalidation was delivered first.
+export interface HappyPath {
+  decision: "ALLOW" | "DENY";
+  correct: boolean;
+  servedBy: "cache" | "primary";
+  latencyMs: number;
+  hops: Hop[];
+  note: string;
+}
+
+export interface ClockResult {
+  advancedSec: number;
+  clockSec: number;
+  evicted: CacheEntry[];
+  note: string;
+  hops: Hop[];
 }
 
 export interface WriteResult {
@@ -68,6 +91,8 @@ export interface CacheEntry {
   object: string;
   decision: "ALLOW" | "DENY";
   rev: number;
+  ageSec: number;
+  expiresInSec: number;
 }
 
 export interface State {
@@ -78,6 +103,9 @@ export interface State {
   cache: CacheEntry[];
   queued: QueueMsg[];
   delivered: QueueMsg[];
+  ttlSec: number;
+  enforceTTL: boolean;
+  clockSec: number;
 }
 
 export interface CompareRow {

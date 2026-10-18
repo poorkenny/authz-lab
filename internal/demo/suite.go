@@ -43,16 +43,17 @@ type SuiteResult struct {
 }
 
 // Story runs the five-step story for one strategy: Alice reads, the admin
-// revokes her, Alice reads before the invalidation is delivered, the next
-// invalidation is delivered, and Alice reads again. With autoDeliver the
-// invalidation is delivered right after the commit (feature flag off).
-func Story(s Strategy, autoDeliver bool) (before, after CheckResult, err error) {
+// revokes her, Alice reads again, a fix-up step runs, and Alice reads a last
+// time. The fix-up step delivers the next invalidation, except for the TTL
+// strategy with EnforceTTL, where it fast-forwards the clock past the TTL.
+// With AutoDeliver the invalidation is delivered right after the commit.
+func Story(s Strategy, o Options) (before, after CheckResult, err error) {
 	d, err := New(s)
 	if err != nil {
 		return
 	}
 	defer d.Close()
-	d.AutoDeliver = autoDeliver
+	d.Options = o
 	if _, err = d.Check("user:alice", "doc:42"); err != nil {
 		return
 	}
@@ -62,7 +63,11 @@ func Story(s Strategy, autoDeliver bool) (before, after CheckResult, err error) 
 	if before, err = d.Check("user:alice", "doc:42"); err != nil {
 		return
 	}
-	d.DeliverNext()
+	if s == TTL && o.EnforceTTL {
+		d.Advance(CacheTTLSec)
+	} else {
+		d.DeliverNext()
+	}
 	after, err = d.Check("user:alice", "doc:42")
 	return
 }
@@ -81,7 +86,7 @@ func scenarioCases() ([]TestCase, error) {
 		cases = append(cases, TestCase{Name: name, Kind: "scenario", Strategy: s, Description: desc, Passed: passed, Details: details})
 	}
 
-	ttlBefore, ttlAfter, err := Story(TTL, false)
+	ttlBefore, ttlAfter, err := Story(TTL, Options{})
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +95,26 @@ func scenarioCases() ([]TestCase, error) {
 		!ttlBefore.Correct && !ttlAfter.Correct && ttlAfter.ServedBy == "cache",
 		describe(ttlBefore), describe(ttlAfter))
 
-	invBefore, invAfter, err := Story(Invalidation, false)
+	expBefore, expAfter, err := Story(TTL, Options{EnforceTTL: true})
+	if err != nil {
+		return nil, err
+	}
+	add(TTL, "TTL cache: the stale window ends when the entry's TTL runs out",
+		fmt.Sprintf("With TTL expiry on, the read right after the revoke is a stale cache hit; after fast-forwarding the clock %d s the entry is evicted and SQLite answers DENY.", CacheTTLSec),
+		!expBefore.Correct && expBefore.ServedBy == "cache" && expBefore.EntryAgeSec < CacheTTLSec &&
+			expAfter.Correct && expAfter.Decision == "DENY" && expAfter.ServedBy == "primary",
+		describe(expBefore), describe(expAfter))
+
+	edge, err := ttlEdge()
+	if err != nil {
+		return nil, err
+	}
+	add(TTL, "TTL cache: an entry is served until exactly its TTL",
+		fmt.Sprintf("On a frozen clock, the stale entry is still served %d s after it was cached and evicted at %d s.", CacheTTLSec-1, CacheTTLSec),
+		!edge[0].Correct && edge[0].ServedBy == "cache" && edge[1].Correct && edge[1].ServedBy == "primary",
+		fmt.Sprintf("at %d s: %s", CacheTTLSec-1, describe(edge[0])), fmt.Sprintf("at %d s: %s", CacheTTLSec, describe(edge[1])))
+
+	invBefore, invAfter, err := Story(Invalidation, Options{})
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +122,7 @@ func scenarioCases() ([]TestCase, error) {
 		"SQLite has committed the revoke, but its invalidation is still in the delivery queue, so Alice's read hits the old cached ALLOW: read-after-write inconsistency.",
 		!invBefore.Correct && invBefore.Pending != nil && invBefore.ServedBy == "cache",
 		describe(invBefore))
-	autoBefore, _, err := Story(Invalidation, true)
+	autoBefore, _, err := Story(Invalidation, Options{AutoDeliver: true})
 	if err != nil {
 		return nil, err
 	}
@@ -110,6 +134,20 @@ func scenarioCases() ([]TestCase, error) {
 		"Once the invalidation is delivered, the entry is gone, so the next read goes to SQLite and returns DENY: mitigated, not guaranteed.",
 		invAfter.Correct && invAfter.Decision == "DENY" && invAfter.Pending == nil,
 		describe(invAfter))
+
+	hpBefore, hpAfter, err := Story(Invalidation, Options{HappyPath: true})
+	if err != nil {
+		return nil, err
+	}
+	hpDetails := []string{describe(hpBefore)}
+	if hp := hpBefore.HappyPath; hp != nil {
+		hpDetails = append(hpDetails, fmt.Sprintf("happy path: %s, served by %s, %.2f ms", hp.Decision, hp.ServedBy, hp.LatencyMs))
+	}
+	add(Invalidation, "Invalidation: a read before delivery reports the happy-path result next to its own",
+		"While Alice's invalidation is queued, the response carries both the stale cached ALLOW and the happy-path DENY (event delivered first). After delivery there is nothing to compare.",
+		!hpBefore.Correct && hpBefore.HappyPath != nil && hpBefore.HappyPath.Decision == "DENY" && hpBefore.HappyPath.Correct &&
+			hpAfter.Correct && hpAfter.HappyPath == nil,
+		hpDetails...)
 
 	d, err := New(Invalidation)
 	if err != nil {
@@ -139,7 +177,7 @@ func scenarioCases() ([]TestCase, error) {
 		"Alice's invalidation is queued behind 3 unrelated ones. Her reads stay stale through 3 deliveries and become fresh only when her own event is delivered.",
 		staleUntilHer, details...)
 
-	raBefore, raAfter, err := Story(RevisionAware, false)
+	raBefore, raAfter, err := Story(RevisionAware, Options{})
 	if err != nil {
 		return nil, err
 	}
@@ -152,6 +190,32 @@ func scenarioCases() ([]TestCase, error) {
 		raAfter.Correct && raAfter.ServedBy == "cache",
 		describe(raAfter))
 	return cases, nil
+}
+
+// ttlEdge reads a stale entry one second before and exactly at its TTL, on a frozen clock.
+func ttlEdge() ([2]CheckResult, error) {
+	var out [2]CheckResult
+	d, err := New(TTL)
+	if err != nil {
+		return out, err
+	}
+	defer d.Close()
+	now := time.Unix(0, 0)
+	d.Now = func() time.Time { return now }
+	d.EnforceTTL = true
+	if _, err := d.Check("user:alice", "doc:42"); err != nil {
+		return out, err
+	}
+	if _, err := d.Revoke("user:alice", "doc:42"); err != nil {
+		return out, err
+	}
+	now = now.Add((CacheTTLSec - 1) * time.Second)
+	if out[0], err = d.Check("user:alice", "doc:42"); err != nil {
+		return out, err
+	}
+	now = now.Add(time.Second)
+	out[1], err = d.Check("user:alice", "doc:42")
+	return out, err
 }
 
 // propertyRun replays one random workload against all strategies. Writes,
