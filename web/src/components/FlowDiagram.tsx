@@ -68,7 +68,8 @@ interface Props {
   busy?: boolean;
 }
 
-export function FlowDiagram({ hops, state, actor, onDeliver, busy }: Props) {
+export function FlowDiagram({ hops: hopsProp, state, actor, onDeliver, busy }: Props) {
+  const hops = hopsProp ?? [];
   // Reveal hops one at a time so the path is easy to follow.
   const [shown, setShown] = useState(hops.length);
   useEffect(() => {

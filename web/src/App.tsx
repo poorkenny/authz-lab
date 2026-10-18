@@ -9,12 +9,12 @@ import { STRATEGIES, byId } from "./strategies";
 type Entry = { kind: "check"; r: CheckResult } | { kind: "write"; r: WriteResult } | { kind: "deliver"; r: DeliverResult };
 
 interface Actions {
-  check: (subject: string, object: string) => Promise<void>;
-  write: (op: "grant" | "revoke", subject: string, object: string) => Promise<void>;
-  deliver: () => Promise<void>;
+  check: (subject: string, object: string) => Promise<boolean>;
+  write: (op: "grant" | "revoke", subject: string, object: string) => Promise<boolean>;
+  deliver: () => Promise<boolean>;
 }
 
-type StepDef = { title: string; hint: string; run: (a: Actions) => Promise<void> };
+type StepDef = { title: string; hint: string; run: (a: Actions) => Promise<boolean> };
 
 // With controlled cache delivery the story pauses so the reviewer delivers the
 // invalidation event; without it, events are delivered right after the commit.
@@ -64,21 +64,26 @@ export default function App() {
       .features()
       .then(setFlags)
       .catch(() => {});
-    api.state().then(setState).catch((e: Error) => setError(e.message));
+    // The session survives reloads but the story restarts at step 1, so start
+    // from a fresh world (same strategy) to keep the two in sync.
+    api.reset().then(setState).catch((e: Error) => setError(e.message));
     api
       .compare()
       .then((c) => setRows(c.rows))
       .catch(() => {});
   }, []);
 
-  async function act(f: () => Promise<void>) {
+  // act runs an API action and refreshes state; it resolves to false if the action failed.
+  async function act(f: () => Promise<void>): Promise<boolean> {
     setBusy(true);
     setError("");
     try {
       await f();
       setState(await api.state());
+      return true;
     } catch (e) {
       setError((e as Error).message);
+      return false;
     } finally {
       setBusy(false);
     }
@@ -90,20 +95,20 @@ export default function App() {
       act(async () => {
         const r = await api.check(subject, object);
         push({ kind: "check", r });
-        setHops(r.hops);
+        setHops(r.hops ?? []);
         setActor(`Client (${subject.replace("user:", "")})`);
       }),
     write: (op, subject, object) =>
       act(async () => {
         const r = await api[op](subject, object);
         push({ kind: "write", r });
-        setHops(r.hops);
+        setHops(r.hops ?? []);
       }),
     deliver: () =>
       act(async () => {
         const r = await api.deliver();
         push({ kind: "deliver", r });
-        setHops(r.hops);
+        setHops(r.hops ?? []);
       }),
   };
 
@@ -111,12 +116,13 @@ export default function App() {
   const STEPS = controlled ? CONTROLLED_STEPS : AUTO_STEPS;
 
   async function runStep(i: number) {
-    await STEPS[i].run(actions);
-    setStep(i + 1);
+    // Only advance when the step's action succeeded, so the story can't drift
+    // out of sync with the server (e.g. revoking an already-revoked user).
+    if (await STEPS[i].run(actions)) setStep(i + 1);
   }
 
   const switchTo = (s: Strategy) =>
-    act(async () => {
+    void act(async () => {
       await api.setStrategy(s);
       setStep(0);
       setLog([]);
