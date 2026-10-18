@@ -94,6 +94,14 @@ Invalidation looks cheaper than revision-aware because it keeps serving cached e
 
 ---
 
+## Feature flags
+
+Every feature ships behind a flag; see **[docs/FEATURES.md](docs/FEATURES.md)** for the full list, what each flag does on/off, and how to toggle it locally, in Docker and on Render.
+
+| Flag | Default | Feature |
+|---|---|---|
+| `FEATURE_CONTROLLED_CACHE_DELIVERY` | `true` | Invalidation events wait in the queue until delivered from the UI (deliver step, queue button, section 3 simulation). Off: delivered automatically after each commit. |
+
 ## Run locally
 
 Requirements: Go 1.25+, Node 22+. SQLite is embedded (pure-Go driver `modernc.org/sqlite`, no CGO), so nothing else needs installing.
@@ -111,16 +119,17 @@ All endpoints accept an `X-Lab-Session` header. Each session has two worlds, eac
 
 | Endpoint | Purpose |
 |---|---|
+| `GET /api/v1/features` | active feature flags (see [docs/FEATURES.md](docs/FEATURES.md)) |
 | `GET /api/v1/state` | strategy, SQLite revision, tuples, revision tokens, cache entries, queued + recently delivered invalidations |
 | `POST /api/v1/strategy {strategy: "ttl" \| "invalidation" \| "revision_aware"}` | switch strategy (starts a fresh world) |
 | `POST /api/v1/check {subject, object}` | check `view`. Returns decision, SQLite's answer, served-by, revisions, the user's queued invalidation (position in queue) and **hops with per-hop latency** |
 | `POST /api/v1/grant` · `POST /api/v1/revoke {subject, object}` | change access in SQLite (queues an invalidation event under the invalidation strategy) |
-| `POST /api/v1/deliver` | deliver the invalidation event at the head of the queue |
+| `POST /api/v1/deliver` | deliver the invalidation event at the head of the queue (flag `FEATURE_CONTROLLED_CACHE_DELIVERY`) |
 | `GET /api/v1/compare` | run the five-step story under every strategy |
 | `POST /api/v1/reset` | restore the starting state |
 | `GET /api/v1/audit?stale=true` | audit log of writes and checks |
 | `POST /api/v1/tests/run` | run the correctness suite |
-| `/api/v1/sim/{state,reset,check,grant,revoke,deliver}` | the same operations on the queue-simulation world |
+| `/api/v1/sim/{state,reset,check,grant,revoke,deliver}` | the same operations on the queue-simulation world (flag `FEATURE_CONTROLLED_CACHE_DELIVERY`) |
 | `POST /api/v1/sim/other-writes {count}` | commit 1–10 unrelated writes, each queueing its own invalidation event |
 
 ```bash
@@ -184,6 +193,7 @@ Free-tier limits change; check [render.com/pricing](https://render.com/pricing).
 cmd/server/        HTTP server: API + embedded UI
 internal/demo/     the three strategies, the invalidation delivery queue (queue.go),
                    per-hop latency, and the correctness suite (suite.go, suite_test.go)
+internal/features/ feature flags (documented in docs/FEATURES.md)
 internal/store/    SQLite primary store: tuples, changelog (= revisions), doc revision tokens
 internal/audit/    audit log
 internal/api/      REST handlers, sessions, rate limiting

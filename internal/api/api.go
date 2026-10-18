@@ -15,6 +15,7 @@ import (
 
 	"github.com/poorkenny/authz-lab/internal/audit"
 	"github.com/poorkenny/authz-lab/internal/demo"
+	"github.com/poorkenny/authz-lab/internal/features"
 )
 
 const (
@@ -51,10 +52,11 @@ func (s *session) allow() bool {
 type Server struct {
 	mu       sync.Mutex
 	sessions map[string]*session
+	flags    features.Flags
 }
 
-func NewServer() *Server {
-	s := &Server{sessions: map[string]*session{}}
+func NewServer(flags features.Flags) *Server {
+	s := &Server{sessions: map[string]*session{}, flags: flags}
 	go func() {
 		for range time.Tick(time.Minute) {
 			s.mu.Lock()
@@ -86,7 +88,7 @@ func (s *Server) session(id string) (*session, error) {
 		}
 		s.drop(oldestID)
 	}
-	d, err := demo.New(demo.TTL)
+	d, err := s.newDemo(demo.TTL)
 	if err != nil {
 		return nil, err
 	}
@@ -112,6 +114,25 @@ func (s *Server) drop(id string) {
 	}()
 }
 
+// newDemo creates a main-demo world configured by the feature flags.
+func (s *Server) newDemo(st demo.Strategy) (*demo.Demo, error) {
+	d, err := demo.New(st)
+	if err != nil {
+		return nil, err
+	}
+	d.AutoDeliver = !s.flags.ControlledCacheDelivery
+	return d, nil
+}
+
+// requireControlledDelivery rejects requests for the controlled-cache-delivery
+// feature when its flag is off.
+func (s *Server) requireControlledDelivery() error {
+	if !s.flags.ControlledCacheDelivery {
+		return httpError{http.StatusNotFound, "controlled cache delivery is disabled (FEATURE_CONTROLLED_CACHE_DELIVERY=false)"}
+	}
+	return nil
+}
+
 type world int
 
 const (
@@ -126,6 +147,9 @@ func (s *Server) Routes(mux *http.ServeMux) {
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "sessions": n})
 	})
+	mux.HandleFunc("GET /api/v1/features", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, s.flags)
+	})
 
 	// Routes shared by both worlds: /api/v1/... (main) and /api/v1/sim/... (queue simulation).
 	for prefix, wd := range map[string]world{"/api/v1": mainWorld, "/api/v1/sim": simWorld} {
@@ -133,7 +157,10 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			return (*d).State()
 		}))
 		mux.HandleFunc("POST "+prefix+"/reset", s.with(wd, func(r *http.Request, d **demo.Demo) (any, error) {
-			return reset(d, (*d).Strategy)
+			if wd == simWorld {
+				return s.reset(d, demo.Invalidation, false)
+			}
+			return s.reset(d, (*d).Strategy, true)
 		}))
 		mux.HandleFunc("POST "+prefix+"/grant", s.with(wd, func(r *http.Request, d **demo.Demo) (any, error) {
 			return withPair(r, (*d).Grant)
@@ -145,6 +172,9 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			return withPair(r, (*d).Check)
 		}))
 		mux.HandleFunc("POST "+prefix+"/deliver", s.with(wd, func(r *http.Request, d **demo.Demo) (any, error) {
+			if err := s.requireControlledDelivery(); err != nil {
+				return nil, err
+			}
 			return (*d).DeliverNext(), nil
 		}))
 	}
@@ -161,7 +191,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			return nil, badRequest(err)
 		}
 		// A strategy change starts a fresh world so runs are comparable.
-		return reset(d, st)
+		return s.reset(d, st, true)
 	}))
 	mux.HandleFunc("POST /api/v1/sim/other-writes", s.with(simWorld, func(r *http.Request, d **demo.Demo) (any, error) {
 		var req struct {
@@ -186,7 +216,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 		}
 		var rows []row
 		for _, st := range demo.Strategies {
-			before, after, err := demo.Story(st)
+			before, after, err := demo.Story(st, !s.flags.ControlledCacheDelivery)
 			if err != nil {
 				return nil, err
 			}
@@ -236,6 +266,10 @@ func (s *Server) with(wd world, h func(r *http.Request, d **demo.Demo) (any, err
 		}
 		target := &ss.demo
 		if wd == simWorld {
+			if err := s.requireControlledDelivery(); err != nil {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+				return
+			}
 			target = &ss.sim
 		}
 		out, err := h(r, target)
@@ -252,8 +286,15 @@ func (s *Server) with(wd world, h func(r *http.Request, d **demo.Demo) (any, err
 	}
 }
 
-func reset(d **demo.Demo, st demo.Strategy) (any, error) {
-	fresh, err := demo.New(st)
+// reset replaces a world with a fresh one; main-demo worlds follow the feature flags.
+func (s *Server) reset(d **demo.Demo, st demo.Strategy, main bool) (any, error) {
+	var fresh *demo.Demo
+	var err error
+	if main {
+		fresh, err = s.newDemo(st)
+	} else {
+		fresh, err = demo.New(st)
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -3,7 +3,7 @@ import { api } from "../api";
 import type { StrategyStats, SuiteResult } from "../types";
 import { STRATEGIES, byId } from "../strategies";
 
-export function TestsPanel() {
+export function TestsPanel({ section }: { section: number }) {
   const [result, setResult] = useState<SuiteResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -32,7 +32,7 @@ export function TestsPanel() {
 
   return (
     <section className="card" aria-labelledby="tests-h">
-      <h2 id="tests-h">4 · Correctness tests</h2>
+      <h2 id="tests-h">{section} · Correctness tests</h2>
       <p>
         The server runs the suite on demand. It's the same code that <code>go test ./internal/demo</code> runs in CI: scenario tests for the story above, and a
         randomized property test that replays identical workloads against all three strategies on SQLite.

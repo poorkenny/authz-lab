@@ -8,3 +8,7 @@ services:
     dockerContext: .
     healthCheckPath: /healthz
     autoDeploy: true
+    # Feature flags: see docs/FEATURES.md
+    envVars:
+      - key: FEATURE_CONTROLLED_CACHE_DELIVERY
+        value: "true"

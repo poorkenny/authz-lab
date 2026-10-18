@@ -80,6 +80,9 @@ type Demo struct {
 	Store    *store.Store
 	Audit    *audit.Log
 	Queue    *Queue
+	// AutoDeliver delivers each invalidation event right after its commit
+	// instead of waiting for DeliverNext (controlled-cache-delivery flag off).
+	AutoDeliver bool
 
 	cache       map[string]CacheEntry
 	invalidated map[string]QueueMsg // cache key → the delivery that removed it
@@ -181,6 +184,11 @@ func (d *Demo) change(op store.Op, subject, object string) (WriteResult, error) 
 		r.Message = &m
 		r.Note = fmt.Sprintf("Committed to SQLite at rev %d. Invalidation #%d for %s → %s is now queued (position %d of %d). Until it is delivered, the cache still holds the old decision.", c.Rev, m.ID, subject, object, d.Queue.Depth(), d.Queue.Depth())
 		r.Hops = append(r.Hops, Hop{From: "primary", To: "queue", Label: fmt.Sprintf("enqueue invalidation #%d (queue depth %d)", m.ID, d.Queue.Depth()), Ms: EnqueueMs, Kind: "async"})
+		if d.AutoDeliver {
+			dr := d.DeliverNext()
+			r.Hops = append(r.Hops, dr.Hops...)
+			r.Note = fmt.Sprintf("Committed to SQLite at rev %d. Invalidation #%d was delivered automatically right after the commit: %s", c.Rev, m.ID, dr.Note)
+		}
 	case RevisionAware:
 		r.Note = fmt.Sprintf("Committed to SQLite at rev %d. %s's revision token is now %d; requests carry it, so the cache needs no invalidation.", c.Rev, object, c.Rev)
 		r.Hops = append(r.Hops, Hop{From: "primary", To: "queue", Label: fmt.Sprintf("no invalidation needed: token for %s is now %d", object, c.Rev), Kind: "none"})

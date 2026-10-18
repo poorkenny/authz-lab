@@ -56,7 +56,7 @@ export function shortLabel(h: Hop, i: number, hops: Hop[]): string {
 
 export const fmtMs = (ms: number) => (ms < 0.1 && ms > 0 ? ms.toFixed(2) : ms.toFixed(1));
 
-export const hopMs = (h: Hop) => (h.kind === "none" ? "—" : h.from === "queue" ? "manual" : `${fmtMs(h.ms)} ms`);
+export const hopMs = (h: Hop) => (h.kind === "none" ? "—" : h.from === "queue" ? "async" : `${fmtMs(h.ms)} ms`);
 
 const who = (s: string) => s.replace("user:", "");
 

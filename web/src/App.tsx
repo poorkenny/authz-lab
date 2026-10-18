@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "./api";
-import type { CheckResult, CompareRow, DeliverResult, Hop, State, Strategy, WriteResult } from "./types";
+import type { CheckResult, CompareRow, DeliverResult, Features, Hop, State, Strategy, WriteResult } from "./types";
 import { FlowDiagram, fmtMs, hopMs, shortLabel } from "./components/FlowDiagram";
 import { QueueSimulation } from "./components/QueueSimulation";
 import { TestsPanel } from "./components/TestsPanel";
@@ -14,12 +14,21 @@ interface Actions {
   deliver: () => Promise<void>;
 }
 
-const STEPS: { title: string; hint: string; run: (a: Actions) => Promise<void> }[] = [
+type StepDef = { title: string; hint: string; run: (a: Actions) => Promise<void> };
+
+// With controlled cache delivery the story pauses so the reviewer delivers the
+// invalidation event; without it, events are delivered right after the commit.
+const CONTROLLED_STEPS: StepDef[] = [
   { title: "Alice opens doc:42", hint: "Cache miss → SQLite → ALLOW is cached.", run: (a) => a.check("user:alice", "doc:42") },
   { title: "Admin revokes Alice", hint: "SQLite commits the revoke. Invalidation strategy: an event is queued.", run: (a) => a.write("revoke", "user:alice", "doc:42") },
   { title: "Alice reads before delivery", hint: "The invalidation event is still in the queue.", run: (a) => a.check("user:alice", "doc:42") },
   { title: "Deliver the invalidation event", hint: "Manual: delivers the head of the queue to the cache.", run: (a) => a.deliver() },
   { title: "Alice reads after delivery", hint: "Is the cache fresh now?", run: (a) => a.check("user:alice", "doc:42") },
+];
+const AUTO_STEPS: StepDef[] = [
+  { title: "Alice opens doc:42", hint: "Cache miss → SQLite → ALLOW is cached.", run: (a) => a.check("user:alice", "doc:42") },
+  { title: "Admin revokes Alice", hint: "SQLite commits the revoke. Invalidation strategy: the event is delivered right away.", run: (a) => a.write("revoke", "user:alice", "doc:42") },
+  { title: "Alice reads again", hint: "Is the cache fresh?", run: (a) => a.check("user:alice", "doc:42") },
 ];
 
 // Latency of each path through the system (sum of the modelled hops).
@@ -38,6 +47,7 @@ function pathOf(r: CheckResult): string {
 
 export default function App() {
   const [state, setState] = useState<State | null>(null);
+  const [flags, setFlags] = useState<Features>({ controlledCacheDelivery: true });
   const [step, setStep] = useState(0);
   const [log, setLog] = useState<Entry[]>([]);
   const [hops, setHops] = useState<Hop[]>([]);
@@ -50,6 +60,10 @@ export default function App() {
   const demoRef = useRef<HTMLElement>(null);
 
   useEffect(() => {
+    api
+      .features()
+      .then(setFlags)
+      .catch(() => {});
     api.state().then(setState).catch((e: Error) => setError(e.message));
     api
       .compare()
@@ -92,6 +106,9 @@ export default function App() {
         setHops(r.hops);
       }),
   };
+
+  const controlled = flags.controlledCacheDelivery;
+  const STEPS = controlled ? CONTROLLED_STEPS : AUTO_STEPS;
 
   async function runStep(i: number) {
     await STEPS[i].run(actions);
@@ -190,7 +207,7 @@ export default function App() {
         </ol>
         {error && <p className="txt-bad">{error}</p>}
 
-        <FlowDiagram hops={hops} state={state} actor={actor} onDeliver={actions.deliver} busy={busy} />
+        <FlowDiagram hops={hops} state={state} actor={actor} onDeliver={controlled ? actions.deliver : undefined} busy={busy} />
 
         {lastEntry && (
           <div className="result-row">
@@ -291,8 +308,8 @@ export default function App() {
               <thead>
                 <tr>
                   <th scope="col">strategy</th>
-                  <th scope="col">read before delivery</th>
-                  <th scope="col">read after delivery</th>
+                  <th scope="col">{controlled ? "read before delivery" : "read after revoke"}</th>
+                  <th scope="col">{controlled ? "read after delivery" : "read again"}</th>
                   <th scope="col">verdict</th>
                 </tr>
               </thead>
@@ -334,9 +351,11 @@ export default function App() {
             <button disabled={busy} onClick={() => actions.write("revoke", user, doc)}>
               Revoke viewer
             </button>
-            <button disabled={busy} onClick={actions.deliver}>
-              Deliver next invalidation
-            </button>
+            {controlled && (
+              <button disabled={busy} onClick={actions.deliver}>
+                Deliver next invalidation
+              </button>
+            )}
           </div>
           {state && (
             <p className="mono small">
@@ -367,11 +386,11 @@ export default function App() {
         </details>
       </section>
 
-      <QueueSimulation />
+      {controlled && <QueueSimulation />}
 
-      <TestsPanel />
+      <TestsPanel section={controlled ? 4 : 3} />
 
-      <footer className="muted small">Mock system with modelled latencies, backed by an in-memory SQLite store per browser session. Invalidation events are delivered only when you click.</footer>
+      <footer className="muted small">Mock system with modelled latencies, backed by an in-memory SQLite store per browser session. {controlled ? "Invalidation events are delivered only when you click." : "Invalidation events are delivered automatically after each commit."}</footer>
     </div>
   );
 }

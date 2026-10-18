@@ -1,4 +1,4 @@
-import type { CheckResult, CompareRow, DeliverResult, State, Strategy, SuiteResult, WriteResult } from "./types";
+import type { CheckResult, CompareRow, DeliverResult, Features, State, Strategy, SuiteResult, WriteResult } from "./types";
 
 const SESSION_KEY = "authz-lab-session";
 let memorySession = "";
@@ -44,6 +44,7 @@ function world(prefix: string) {
 
 export const api = {
   ...world("/api/v1"),
+  features: () => call<Features>("GET", "/api/v1/features"),
   setStrategy: (strategy: Strategy) => call<State>("POST", "/api/v1/strategy", { strategy }),
   compare: () => call<{ rows: CompareRow[] }>("GET", "/api/v1/compare"),
   runTests: () => call<SuiteResult>("POST", "/api/v1/tests/run"),

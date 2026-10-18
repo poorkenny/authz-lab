@@ -44,13 +44,15 @@ type SuiteResult struct {
 
 // Story runs the five-step story for one strategy: Alice reads, the admin
 // revokes her, Alice reads before the invalidation is delivered, the next
-// invalidation is delivered, and Alice reads again.
-func Story(s Strategy) (before, after CheckResult, err error) {
+// invalidation is delivered, and Alice reads again. With autoDeliver the
+// invalidation is delivered right after the commit (feature flag off).
+func Story(s Strategy, autoDeliver bool) (before, after CheckResult, err error) {
 	d, err := New(s)
 	if err != nil {
 		return
 	}
 	defer d.Close()
+	d.AutoDeliver = autoDeliver
 	if _, err = d.Check("user:alice", "doc:42"); err != nil {
 		return
 	}
@@ -79,7 +81,7 @@ func scenarioCases() ([]TestCase, error) {
 		cases = append(cases, TestCase{Name: name, Kind: "scenario", Strategy: s, Description: desc, Passed: passed, Details: details})
 	}
 
-	ttlBefore, ttlAfter, err := Story(TTL)
+	ttlBefore, ttlAfter, err := Story(TTL, false)
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +90,7 @@ func scenarioCases() ([]TestCase, error) {
 		!ttlBefore.Correct && !ttlAfter.Correct && ttlAfter.ServedBy == "cache",
 		describe(ttlBefore), describe(ttlAfter))
 
-	invBefore, invAfter, err := Story(Invalidation)
+	invBefore, invAfter, err := Story(Invalidation, false)
 	if err != nil {
 		return nil, err
 	}
@@ -96,6 +98,14 @@ func scenarioCases() ([]TestCase, error) {
 		"SQLite has committed the revoke, but its invalidation is still in the delivery queue, so Alice's read hits the old cached ALLOW: read-after-write inconsistency.",
 		!invBefore.Correct && invBefore.Pending != nil && invBefore.ServedBy == "cache",
 		describe(invBefore))
+	autoBefore, _, err := Story(Invalidation, true)
+	if err != nil {
+		return nil, err
+	}
+	add(Invalidation, "Invalidation with automatic delivery (flag off) reads fresh after the revoke",
+		"With controlled delivery disabled, the event is delivered right after the commit, so the next read already goes to SQLite.",
+		autoBefore.Correct && autoBefore.Decision == "DENY" && autoBefore.Pending == nil,
+		describe(autoBefore))
 	add(Invalidation, "Invalidation: delivering the event fixes the cache",
 		"Once the invalidation is delivered, the entry is gone, so the next read goes to SQLite and returns DENY: mitigated, not guaranteed.",
 		invAfter.Correct && invAfter.Decision == "DENY" && invAfter.Pending == nil,
@@ -129,7 +139,7 @@ func scenarioCases() ([]TestCase, error) {
 		"Alice's invalidation is queued behind 3 unrelated ones. Her reads stay stale through 3 deliveries and become fresh only when her own event is delivered.",
 		staleUntilHer, details...)
 
-	raBefore, raAfter, err := Story(RevisionAware)
+	raBefore, raAfter, err := Story(RevisionAware, false)
 	if err != nil {
 		return nil, err
 	}

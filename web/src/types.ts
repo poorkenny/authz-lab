@@ -2,6 +2,11 @@
 
 export type Strategy = "ttl" | "invalidation" | "revision_aware";
 
+// Feature flags served by GET /api/v1/features (see docs/FEATURES.md).
+export interface Features {
+  controlledCacheDelivery: boolean;
+}
+
 export interface Hop {
   from: string;
   to: string;
