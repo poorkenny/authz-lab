@@ -218,7 +218,7 @@ func (d *Demo) DeliverNext() DeliverResult {
 		case RevisionAware:
 			note = "The revision-aware strategy needs no invalidations, so there is nothing to deliver."
 		}
-		return DeliverResult{Note: note}
+		return DeliverResult{Note: note, Hops: []Hop{}}
 	}
 	key := cacheKey(m.Subject, m.Object)
 	_, removed := d.cache[key]

@@ -84,3 +84,29 @@ func TestOnlyOneTestRunAtATime(t *testing.T) {
 		t.Fatalf("run after the lock is released: got %d passed=%v, want 200 and passed", code, body["passed"])
 	}
 }
+
+// Regression: an empty delivery used to return "hops": null, which crashed
+// the UI (blank page) when "Deliver the invalidation event" was clicked under
+// a strategy without a queue. Every response must carry hops as an array.
+func TestHopsAreNeverNull(t *testing.T) {
+	srv := serve(t, features.Defaults())
+	for _, st := range []string{"ttl", "invalidation", "revision_aware"} {
+		call(t, srv, "POST", "/api/v1/strategy", `{"strategy":"`+st+`"}`)
+		steps := []struct{ method, path, body string }{
+			{"POST", "/api/v1/check", `{"subject":"user:alice","object":"doc:42"}`},
+			{"POST", "/api/v1/revoke", `{"subject":"user:alice","object":"doc:42"}`},
+			{"POST", "/api/v1/deliver", ""},
+			{"POST", "/api/v1/deliver", ""}, // queue already empty
+			{"POST", "/api/v1/check", `{"subject":"user:alice","object":"doc:42"}`},
+		}
+		for _, s := range steps {
+			code, body := call(t, srv, s.method, s.path, s.body)
+			if code != http.StatusOK {
+				t.Fatalf("%s %s %s: status %d %v", st, s.method, s.path, code, body)
+			}
+			if _, ok := body["hops"].([]any); !ok {
+				t.Errorf("%s %s %s: hops = %#v, want an array", st, s.method, s.path, body["hops"])
+			}
+		}
+	}
+}
