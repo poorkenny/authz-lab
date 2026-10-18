@@ -24,7 +24,7 @@ export function TestsPanel() {
     ["checks", (s) => s.checks.toLocaleString()],
     ["wrong decisions", (s) => s.wrong.toLocaleString(), "errors"],
     ["stale ALLOWs", (s) => s.staleAllows.toLocaleString(), "errors"],
-    ["wrong while an invalidation was in flight", (s) => s.inWindow.toLocaleString()],
+    ["wrong while the invalidation was queued", (s) => s.inWindow.toLocaleString()],
     ["cache hit rate", (s) => `${s.hitRatePct.toFixed(1)}%`],
     ["fallbacks to SQLite", (s) => s.fallbacks.toLocaleString()],
     ["mean check latency", (s) => `${s.meanMs.toFixed(2)} ms`],
@@ -70,8 +70,8 @@ export function TestsPanel() {
 
           <h3>Property test: identical workloads, three strategies</h3>
           <p className="muted small">
-            {result.property.seeds} seeds × {result.property.opsPerRun} operations, requests 0-40 ms apart, {result.property.writes.toLocaleString()}{" "}
-            grants/revokes in total.
+            {result.property.seeds} seeds × {result.property.opsPerRun} operations: {result.property.writes.toLocaleString()} grants/revokes and{" "}
+            {result.property.deliveries.toLocaleString()} invalidation deliveries, interleaved with checks in a seeded random order.
           </p>
           <div className="table-scroll">
             <table className="data">
@@ -103,8 +103,9 @@ export function TestsPanel() {
             </table>
           </div>
           <p className="muted small">
-            Invalidation and revision-aware cost about the same here (both re-read SQLite after a change). The difference is the guarantee: every invalidation
-            mistake happened inside a propagation window, and revision-aware made none.
+            Invalidation looks cheaper than revision-aware because it keeps serving cached entries until their event is delivered. Those are exactly the
+            reads where it was wrong (every one happened while the user's invalidation was still queued). Revision-aware pays an extra SQLite round trip right
+            after each change and is never wrong.
           </p>
         </>
       )}

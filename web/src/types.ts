@@ -10,16 +10,17 @@ export interface Hop {
   kind?: "ok" | "stale" | "fallback" | "async" | "none";
 }
 
-export interface InvalidationMsg {
+export interface QueueMsg {
+  id: number;
+  subject: string;
   object: string;
   rev: number;
-  sentAt: number;
-  deliverAt: number;
+  op: "touch" | "delete";
+  status: "queued" | "delivered";
 }
 
 export interface CheckResult {
   id: string;
-  t: number;
   strategy: Strategy;
   subject: string;
   object: string;
@@ -30,21 +31,31 @@ export interface CheckResult {
   cacheRev: number;
   requiredRev: number;
   primaryRev: number;
-  raceWindow: boolean;
-  invalidation?: InvalidationMsg;
+  pending?: QueueMsg;
+  pendingPos?: number;
+  queueDepth: number;
   latencyMs: number;
   hops: Hop[];
   reason: string;
 }
 
 export interface WriteResult {
-  t: number;
   op: "touch" | "delete";
   tuple: string;
   rev: number;
   token: number;
   note: string;
   hops: Hop[];
+  message?: QueueMsg;
+}
+
+export interface DeliverResult {
+  delivered: boolean;
+  message?: QueueMsg;
+  removed: boolean;
+  note: string;
+  hops: Hop[];
+  depth: number;
 }
 
 export interface CacheEntry {
@@ -52,24 +63,22 @@ export interface CacheEntry {
   object: string;
   decision: "ALLOW" | "DENY";
   rev: number;
-  cachedAt: number;
-  expiresAt: number;
 }
 
 export interface State {
   strategy: Strategy;
-  now: number;
   primaryRev: number;
   tuples: string[];
   docRev: Record<string, number>;
   cache: CacheEntry[];
-  pending: InvalidationMsg[];
+  queued: QueueMsg[];
+  delivered: QueueMsg[];
 }
 
 export interface CompareRow {
   strategy: Strategy;
-  soon: CheckResult;
-  later: CheckResult;
+  before: CheckResult;
+  after: CheckResult;
 }
 
 export interface TestCase {
@@ -95,6 +104,6 @@ export interface StrategyStats {
 export interface SuiteResult {
   passed: boolean;
   cases: TestCase[];
-  property: { seeds: number; opsPerRun: number; writes: number; byStrategy: Record<Strategy, StrategyStats> };
+  property: { seeds: number; opsPerRun: number; writes: number; deliveries: number; byStrategy: Record<Strategy, StrategyStats> };
   durationMs: number;
 }
