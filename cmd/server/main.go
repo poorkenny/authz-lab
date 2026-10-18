@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/poorkenny/authz-lab/internal/api"
-	"github.com/poorkenny/authz-lab/internal/lab"
 	"github.com/poorkenny/authz-lab/web"
 )
 
@@ -21,7 +20,7 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	(&api.Server{Sessions: lab.NewManager(500, 30*time.Minute)}).Routes(mux)
+	api.NewServer().Routes(mux)
 	mux.Handle("/", spa(web.Dist()))
 
 	srv := &http.Server{

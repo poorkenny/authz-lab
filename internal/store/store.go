@@ -1,9 +1,7 @@
 // Package store is the primary (source-of-truth) relationship tuple store.
 //
 // Every write gets a monotonically increasing revision and is appended to a
-// changelog. The full history is kept so any revision can be read, which is
-// what replicas (snapshots at an older revision) and the oracle (ground truth
-// at the latest revision) both rely on.
+// changelog. The full history is kept so any revision can be read.
 package store
 
 import (
@@ -66,12 +64,8 @@ type Change struct {
 	Tuple Tuple `json:"tuple"`
 	// At is the simulated time (ms) the primary committed the change.
 	At int64 `json:"at"`
-	// Revoke marks deletes, which can only shrink access. Revocations also go
-	// out on the watermark fast lane.
+	// Revoke marks deletes, which can only shrink access.
 	Revoke bool `json:"revoke"`
-	// Affected lists the objects whose permissions may shrink because of this
-	// revocation, including indirect dependents (group -> folder -> doc).
-	Affected []string `json:"affected,omitempty"`
 }
 
 type version struct {
@@ -113,12 +107,7 @@ func (s *Store) Write(op Op, t Tuple, at int64) (Change, error) {
 		return Change{}, fmt.Errorf("unknown op %q", op)
 	}
 
-	c := Change{Rev: s.rev + 1, Op: op, Tuple: t, At: at}
-	if op == OpDelete {
-		c.Revoke = true
-		// Computed against the state before the delete, while the path still exists.
-		c.Affected = s.affectedBy(t)
-	}
+	c := Change{Rev: s.rev + 1, Op: op, Tuple: t, At: at, Revoke: op == OpDelete}
 
 	s.rev = c.Rev
 	subjects := s.index[key]
@@ -169,68 +158,5 @@ func (s *Store) Tuples(rev int64, object string) []Tuple {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].String() < out[j].String() })
-	return out
-}
-
-// affectedBy computes, at the current revision, every object whose view
-// permission could shrink if t were removed.
-func (s *Store) affectedBy(t Tuple) []string {
-	affected := map[string]bool{}
-	if t.Relation == "member" {
-		// Walk up nested groups, then collect objects that grant to any of them.
-		groups := []string{t.Object}
-		seen := map[string]bool{t.Object: true}
-		for len(groups) > 0 {
-			g := groups[0]
-			groups = groups[1:]
-			for _, ref := range s.referencing(g + "#member") {
-				switch ref.Relation {
-				case "member":
-					if !seen[ref.Object] {
-						seen[ref.Object] = true
-						groups = append(groups, ref.Object)
-					}
-				case "viewer", "owner":
-					affected[ref.Object] = true
-				}
-			}
-		}
-	} else {
-		affected[t.Object] = true
-	}
-
-	// Anything inheriting through parent links is affected too.
-	queue := make([]string, 0, len(affected))
-	for o := range affected {
-		queue = append(queue, o)
-	}
-	for len(queue) > 0 {
-		o := queue[0]
-		queue = queue[1:]
-		for _, ref := range s.referencing(o) {
-			if ref.Relation == "parent" && !affected[ref.Object] {
-				affected[ref.Object] = true
-				queue = append(queue, ref.Object)
-			}
-		}
-	}
-
-	out := make([]string, 0, len(affected))
-	for o := range affected {
-		out = append(out, o)
-	}
-	sort.Strings(out)
-	return out
-}
-
-// referencing returns tuples (at the current revision) whose subject is subj.
-func (s *Store) referencing(subj string) []Tuple {
-	var out []Tuple
-	for key, subjects := range s.index {
-		if _, ok := subjects[subj]; ok && s.Has(key, subj, s.rev) {
-			obj, rel, _ := strings.Cut(key, "#")
-			out = append(out, Tuple{Object: obj, Relation: rel, Subject: subj})
-		}
-	}
 	return out
 }

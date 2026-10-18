@@ -1,238 +1,191 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { LabEvent } from "../types";
+import { useEffect, useState } from "react";
+import type { CacheEntry, Hop, State } from "../types";
 
-interface NodeDef {
-  id: string;
+interface Box {
   x: number;
   y: number;
+  w: number;
+  h: number;
   label: string;
-  sub: string;
 }
 
-const W = 150;
-const H = 46;
+const BOXES: Record<string, Box> = {
+  client: { x: 20, y: 70, w: 130, h: 56, label: "Client" },
+  checkapi: { x: 300, y: 70, w: 170, h: 56, label: "Check API" },
+  cache: { x: 660, y: 40, w: 228, h: 118, label: "Permission cache" },
+  primary: { x: 300, y: 270, w: 220, h: 100, label: "Primary store" },
+  admin: { x: 20, y: 292, w: 130, h: 56, label: "Admin" },
+};
 
-const NODES: NodeDef[] = [
-  { id: "client", x: 75, y: 220, label: "Client / app", sub: "Alice, Bob" },
-  { id: "writeapi", x: 270, y: 80, label: "Write API", sub: "grants & revokes" },
-  { id: "content", x: 270, y: 220, label: "Content store", sub: "always fresh" },
-  { id: "checkapi", x: 270, y: 360, label: "Check API", sub: "engine + defenses" },
-  { id: "primary", x: 490, y: 80, label: "Primary store", sub: "source of truth" },
-  { id: "audit", x: 490, y: 220, label: "Audit log", sub: "+ oracle verdict" },
-  { id: "changelog", x: 710, y: 50, label: "Changelog", sub: "bulk, ordered" },
-  { id: "fastlane", x: 710, y: 140, label: "Watermark lane", sub: "tiny, fast" },
-  { id: "replica-1", x: 915, y: 240, label: "replica-1", sub: "" },
-  { id: "replica-2", x: 915, y: 320, label: "replica-2", sub: "" },
-  { id: "replica-3", x: 915, y: 400, label: "replica-3", sub: "" },
-];
-const REPLICAS = ["replica-1", "replica-2", "replica-3"];
-const byId = Object.fromEntries(NODES.map((n) => [n.id, n]));
-
-const EDGES: [string, string][] = [
-  ["client", "writeapi"],
-  ["client", "content"],
-  ["client", "checkapi"],
-  ["writeapi", "primary"],
-  ["writeapi", "audit"],
-  ["checkapi", "audit"],
-  ["checkapi", "primary"],
-  ["primary", "changelog"],
-  ["primary", "fastlane"],
-  ...REPLICAS.flatMap((r): [string, string][] => [
-    ["changelog", r],
-    ["fastlane", r],
-    ["checkapi", r],
-  ]),
-];
-
+const center = (b: Box) => ({ x: b.x + b.w / 2, y: b.y + b.h / 2 });
 const edgeKey = (a: string, b: string) => [a, b].sort().join("|");
 
-interface Props {
-  events: LabEvent[];
-  title?: string;
+// Where each edge's latency labels sit.
+const LABEL_POS: Record<string, { x: number; y: number; anchor: "start" | "middle" }> = {
+  [edgeKey("client", "checkapi")]: { x: 225, y: 62, anchor: "middle" },
+  [edgeKey("checkapi", "cache")]: { x: 478, y: 124, anchor: "start" },
+  [edgeKey("checkapi", "primary")]: { x: 420, y: 200, anchor: "start" },
+  [edgeKey("admin", "primary")]: { x: 225, y: 345, anchor: "middle" },
+  [edgeKey("primary", "cache")]: { x: 612, y: 240, anchor: "start" },
+};
+
+const EDGES: [string, string][] = [
+  ["client", "checkapi"],
+  ["checkapi", "cache"],
+  ["checkapi", "primary"],
+  ["admin", "primary"],
+  ["primary", "cache"],
+];
+
+export function shortLabel(h: Hop, i: number, hops: Hop[]): string {
+  const k = `${h.from}>${h.to}`;
+  if (k === "client>checkapi") return "request";
+  if (k === "checkapi>client") return "response";
+  if (k === "cache>checkapi") return "revision check";
+  if (k === "checkapi>primary") return h.kind === "fallback" ? "fallback to primary" : "evaluate at primary";
+  if (k === "checkapi>cache") return hops.slice(0, i).some((p) => p.from === "checkapi" && p.to === "cache") ? "cache refresh" : "cache lookup";
+  if (k === "admin>primary") return "commit write";
+  if (k === "primary>cache") return "invalidation LOST";
+  return h.label;
 }
 
-export function FlowDiagram({ events, title }: Props) {
-  const [idx, setIdx] = useState(events.length - 1);
-  const [playing, setPlaying] = useState(false);
-  const listRef = useRef<HTMLOListElement>(null);
+export const fmtMs = (ms: number) => (ms < 0.1 && ms > 0 ? ms.toFixed(2) : ms.toFixed(1));
 
-  // Start every new run at the beginning and auto-play it.
+interface Props {
+  hops: Hop[];
+  state: State | null;
+  actor: string;
+}
+
+export function FlowDiagram({ hops, state, actor }: Props) {
+  // Reveal hops one at a time so the path is easy to follow.
+  const [shown, setShown] = useState(hops.length);
   useEffect(() => {
-    setIdx(0);
-    setPlaying(events.length > 0);
-  }, [events]);
-
+    setShown(0);
+  }, [hops]);
   useEffect(() => {
-    if (!playing) return;
-    if (idx >= events.length - 1) {
-      setPlaying(false);
-      return;
-    }
-    const timer = setTimeout(() => setIdx((i) => i + 1), 650);
-    return () => clearTimeout(timer);
-  }, [playing, idx, events.length]);
+    if (shown >= hops.length) return;
+    const t = setTimeout(() => setShown((n) => n + 1), 450);
+    return () => clearTimeout(t);
+  }, [shown, hops.length]);
 
-  useEffect(() => {
-    listRef.current?.querySelector('[aria-current="step"]')?.scrollIntoView({ block: "nearest" });
-  }, [idx]);
+  const visible = hops.slice(0, shown);
+  const lostInvalidation = hops.some((h) => h.kind === "lost") && shown >= hops.length;
+  const byEdge = new Map<string, { n: number; text: string; kind?: string }[]>();
+  visible.forEach((h, i) => {
+    const key = edgeKey(h.from, h.to);
+    const list = byEdge.get(key) ?? [];
+    list.push({ n: i + 1, text: `${shortLabel(h, i, hops).replace("revision check", "rev check")} · ${h.kind === "lost" ? "—" : fmtMs(h.ms) + " ms"}`, kind: h.kind });
+    byEdge.set(key, list);
+  });
+  const current = visible[visible.length - 1];
+  const total = visible.reduce((a, h) => a + h.ms, 0);
+  const token = state?.docRev["doc:42"] ?? 0;
 
-  const state = useMemo(() => {
-    const s = {
-      primaryRev: 0,
-      applied: {} as Record<string, number>,
-      watermark: {} as Record<string, number>,
-      cut: {} as Record<string, boolean>,
-    };
-    for (const e of events.slice(0, idx + 1)) {
-      if (e.kind === "write" && e.to === "primary" && e.rev) s.primaryRev = Math.max(s.primaryRev, e.rev);
-      if (e.kind === "replicate" && e.rev) s.applied[e.to] = Math.max(s.applied[e.to] ?? 0, e.rev);
-      if (e.kind === "watermark" && e.from === "fastlane" && e.rev) s.watermark[e.to] = Math.max(s.watermark[e.to] ?? 0, e.rev);
-      if (e.kind === "partition") s.cut[e.to] = true;
-    }
-    return s;
-  }, [events, idx]);
-
-  const current = events[idx];
-  const activeKey = current ? edgeKey(current.from, current.to) : "";
-  const sev = current?.severity ?? "info";
-
-  if (events.length === 0) {
-    return (
-      <section className="card diagram">
-        <h3>Data flow</h3>
-        <p className="muted">Run a step to see how data and checks move between components.</p>
-      </section>
-    );
-  }
-
-  const from = current && byId[current.from];
-  const to = current && byId[current.to];
+  const isStale = (e: CacheEntry) => e.rev < (state?.docRev[e.object] ?? 0);
 
   return (
-    <section className="card diagram" aria-label="Data flow diagram">
-      <div className="diagram-head">
-        <h3>{title ?? "Data flow"}</h3>
-        <span className="muted mono">
-          t = {current?.t ?? 0} ms · primary rev {state.primaryRev}
-        </span>
-      </div>
+    <figure className="diagram" aria-label="Data flow with per-hop latency">
       <div className="diagram-scroll">
-        <svg viewBox="0 0 1000 440" role="img" aria-label="Components of the authorization system and the current data flow">
+        <svg viewBox="0 0 900 390" role="img" aria-label="Client, Check API, permission cache, primary store and admin, with the hops of the last request">
           <defs>
-            <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-              <path d="M0,0 L10,5 L0,10 z" className={`arrowhead sev-${sev}`} />
+            <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="context-stroke" />
             </marker>
           </defs>
           {EDGES.map(([a, b]) => {
-            const na = byId[a];
-            const nb = byId[b];
-            const cut = (REPLICAS.includes(b) && (a === "changelog" || a === "fastlane") && state.cut[b]) || false;
+            const ca = center(BOXES[a]);
+            const cb = center(BOXES[b]);
+            const key = edgeKey(a, b);
+            const used = byEdge.get(key);
+            const kinds = used?.map((u) => u.kind) ?? [];
+            const cls = key === edgeKey("primary", "cache") && lostInvalidation
+              ? "edge lost"
+              : used
+                ? `edge used ${kinds.includes("stale") ? "k-stale" : kinds.includes("fallback") ? "k-fallback" : ""}`
+                : "edge";
+            const active = current && edgeKey(current.from, current.to) === key;
+            return <line key={key} x1={ca.x} y1={ca.y} x2={cb.x} y2={cb.y} className={`${cls} ${active ? "active" : ""}`} />;
+          })}
+          {lostInvalidation && (
+            <text x={592} y={217} className="lost-x" textAnchor="middle">
+              ✕
+            </text>
+          )}
+
+          {Object.entries(BOXES).map(([id, b]) => {
+            const involved = visible.some((h) => h.from === id || h.to === id);
             return (
-              <line
-                key={a + b}
-                x1={na.x}
-                y1={na.y}
-                x2={nb.x}
-                y2={nb.y}
-                className={`edge ${edgeKey(a, b) === activeKey ? "edge-active sev-" + sev : ""} ${cut ? "edge-cut" : ""}`}
-              />
+              <g key={id} className={`box ${involved ? "involved" : ""}`}>
+                <rect x={b.x} y={b.y} width={b.w} height={b.h} rx="10" />
+                <text x={b.x + 12} y={b.y + 22} className="box-title">
+                  {id === "client" ? actor : b.label}
+                </text>
+                {id === "checkapi" && (
+                  <text x={b.x + 12} y={b.y + 42} className="box-sub">
+                    {state?.mode === "revision_aware" ? "revision-aware" : "plain cache"}
+                  </text>
+                )}
+                {id === "primary" && state && (
+                  <>
+                    <text x={b.x + 12} y={b.y + 44} className="box-sub">
+                      source of truth · rev {state.primaryRev}
+                    </text>
+                    <text x={b.x + 12} y={b.y + 64} className="box-sub">
+                      doc:42 revision token = {token}
+                    </text>
+                    <text x={b.x + 12} y={b.y + 84} className="box-sub">
+                      doc:7 revision token = {state.docRev["doc:7"] ?? 0}
+                    </text>
+                  </>
+                )}
+                {id === "cache" && state && (
+                  <>
+                    {state.cache.length === 0 && (
+                      <text x={b.x + 12} y={b.y + 46} className="box-sub">
+                        empty
+                      </text>
+                    )}
+                    {state.cache.slice(0, 4).map((e, i) => (
+                      <text key={e.subject + e.object} x={b.x + 12} y={b.y + 46 + i * 18} className={`box-sub entry ${isStale(e) ? "stale-entry" : ""}`}>
+                        {e.subject.replace("user:", "")}→{e.object} {e.decision} @rev {e.rev}
+                        {isStale(e) ? " ⚠ stale" : ""}
+                      </text>
+                    ))}
+                  </>
+                )}
+              </g>
             );
           })}
-          {from && to && (
-            <line
-              x1={from.x}
-              y1={from.y}
-              x2={(from.x + to.x) / 2}
-              y2={(from.y + to.y) / 2}
-              className={`edge-arrow sev-${sev}`}
-              markerEnd="url(#arrow)"
-            />
-          )}
-          {from && to && (
-            <circle key={current.seq} r="7" className={`packet sev-${sev}`}>
-              <animateMotion dur="0.55s" fill="freeze" path={`M${from.x},${from.y} L${to.x},${to.y}`} />
-            </circle>
-          )}
-          {NODES.map((n) => {
-            const isReplica = REPLICAS.includes(n.id);
-            const active = current && (current.from === n.id || current.to === n.id);
-            const behind = isReplica && (state.applied[n.id] ?? 0) < state.primaryRev;
-            let sub = n.sub;
-            if (isReplica) {
-              sub = `rev ${state.applied[n.id] ?? 0}` + (state.watermark[n.id] ? ` · wm ${state.watermark[n.id]}` : "");
-            } else if (n.id === "primary") {
-              sub = `rev ${state.primaryRev}`;
-            }
+
+          {[...byEdge.entries()].map(([key, items]) => {
+            const pos = LABEL_POS[key];
             return (
-              <g key={n.id} className={`node ${active ? "node-active" : ""} ${state.cut[n.id] ? "node-cut" : ""} ${behind ? "node-behind" : ""}`}>
-                <rect x={n.x - W / 2} y={n.y - H / 2} width={W} height={H} rx="8" />
-                <text x={n.x} y={n.y - 4} textAnchor="middle" className="node-label">
-                  {n.label}
-                </text>
-                <text x={n.x} y={n.y + 13} textAnchor="middle" className="node-sub">
-                  {state.cut[n.id] ? "PARTITIONED · " + sub : sub}
-                </text>
+              <g key={key}>
+                {items.map((it, j) => (
+                  <text key={it.n} x={pos.x} y={pos.y + j * 16} textAnchor={pos.anchor} className={`hop-label k-${it.kind ?? "none"}`}>
+                    <tspan className="hop-n">{it.n}</tspan> {it.text}
+                  </text>
+                ))}
               </g>
             );
           })}
         </svg>
       </div>
-
-      <div className={`event-now sev-${sev}`} aria-live="polite">
-        <strong>
-          {idx + 1}/{events.length} · {current?.kind}
-        </strong>{" "}
-        <span className="mono">
-          {current?.from} → {current?.to}
-        </span>
-        <div>{current?.label}</div>
-      </div>
-
-      <div className="scrubber">
-        <button onClick={() => setIdx(0)} aria-label="First event">⏮</button>
-        <button onClick={() => setIdx((i) => Math.max(0, i - 1))} aria-label="Previous event">◀</button>
-        <button className="primary-btn" onClick={() => (idx >= events.length - 1 ? (setIdx(0), setPlaying(true)) : setPlaying((p) => !p))}>
-          {playing ? "Pause" : idx >= events.length - 1 ? "Replay" : "Play"}
-        </button>
-        <button onClick={() => setIdx((i) => Math.min(events.length - 1, i + 1))} aria-label="Next event">▶</button>
-        <button onClick={() => setIdx(events.length - 1)} aria-label="Last event">⏭</button>
-        <input
-          type="range"
-          min={0}
-          max={events.length - 1}
-          value={idx}
-          onChange={(e) => {
-            setPlaying(false);
-            setIdx(Number(e.target.value));
-          }}
-          aria-label="Timeline position"
-        />
-      </div>
-
-      <ol className="event-list" ref={listRef}>
-        {events.map((e, i) => (
-          <li
-            key={e.seq}
-            aria-current={i === idx ? "step" : undefined}
-            className={`sev-${e.severity ?? "info"} ${i > idx ? "future" : ""}`}
-            onClick={() => {
-              setPlaying(false);
-              setIdx(i);
-            }}
-          >
-            <span className="mono t">{e.t} ms</span>
-            <span className="mono route">
-              {e.from} → {e.to}
+      <figcaption className="diagram-foot">
+        {hops.length === 0 ? (
+          <span className="muted">Run a step to trace a request through the system.</span>
+        ) : (
+          <>
+            <span>
+              Hop {Math.min(shown, hops.length)}/{hops.length}
+              {current && <> · {current.label}</>}
             </span>
-            <span>{e.label}</span>
-          </li>
-        ))}
-      </ol>
-      <p className="legend muted">
-        <span className="dot sev-ok" /> fresh / defense worked <span className="dot sev-warn" /> revocation / cost{" "}
-        <span className="dot sev-danger" /> stale or blocked · <em>rev</em> = applied revision, <em>wm</em> = revocation watermark received
-      </p>
-    </section>
+            <strong className="total">critical path: {fmtMs(total)} ms</strong>
+            <button onClick={() => setShown(0)}>Replay</button>
+          </>
+        )}
+      </figcaption>
+    </figure>
   );
 }

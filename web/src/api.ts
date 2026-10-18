@@ -1,9 +1,9 @@
-import type { AuditRecord, Config, DrillResult, SweepResult } from "./types";
+import type { CheckResult, Mode, State, SuiteResult, WriteResult } from "./types";
 
 const SESSION_KEY = "authz-lab-session";
 let memorySession = "";
 
-// One isolated lab session per browser, so reviewers never share state.
+// One isolated demo session per browser, so reviewers never share state.
 function sessionId(): string {
   const fresh = () => crypto.randomUUID().replace(/-/g, "");
   try {
@@ -31,11 +31,11 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
 }
 
 export const api = {
-  drill: (cfg: Config) => call<DrillResult>("POST", "/api/v1/lab/drill", cfg),
-  lagSweep: (req: { lagsMs?: number[]; opsPerPoint?: number; revokeRate?: number; seed?: number }) =>
-    call<SweepResult>("POST", "/api/v1/lab/experiments/lag-sweep", req),
-  audit: (params: Record<string, string>) =>
-    call<{ records: AuditRecord[] }>("GET", "/api/v1/audit?" + new URLSearchParams(params)),
-  schema: () => call<{ schema: string }>("GET", "/api/v1/schema"),
-  session: sessionId,
+  state: () => call<State>("GET", "/api/v1/state"),
+  reset: () => call<State>("POST", "/api/v1/reset"),
+  setMode: (mode: Mode) => call<State>("POST", "/api/v1/mode", { mode }),
+  check: (subject: string, object: string) => call<CheckResult>("POST", "/api/v1/check", { subject, object }),
+  grant: (subject: string, object: string) => call<WriteResult>("POST", "/api/v1/grant", { subject, object }),
+  revoke: (subject: string, object: string) => call<WriteResult>("POST", "/api/v1/revoke", { subject, object }),
+  runTests: () => call<SuiteResult>("POST", "/api/v1/tests/run"),
 };
