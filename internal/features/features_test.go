@@ -18,6 +18,7 @@ func TestFromEnv(t *testing.T) {
 		"FEATURE_CONTROLLED_CACHE_DELIVERY": func(f Flags) bool { return f.ControlledCacheDelivery },
 		"FEATURE_STRATEGY_STORIES":          func(f Flags) bool { return f.StrategyStories },
 		"FEATURE_HAPPY_PATH_COMPARISON":     func(f Flags) bool { return f.HappyPathComparison },
+		"FEATURE_CLIENT_VERSION_TOKEN":      func(f Flags) bool { return f.ClientVersionToken },
 	}
 	for name, get := range flags {
 		for _, c := range cases {

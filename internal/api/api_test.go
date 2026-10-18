@@ -159,3 +159,37 @@ func TestHappyPathComparisonFlag(t *testing.T) {
 		}
 	}
 }
+
+func TestClientVersionTokenFlag(t *testing.T) {
+	alice := `{"subject":"user:alice","object":"doc:42"}`
+	oldToken := `{"subject":"user:alice","object":"doc:42","token":3}`
+	strong := `{"subject":"user:alice","object":"doc:42","consistency":"fully_consistent"}`
+
+	off := serve(t, features.Flags{ClientVersionToken: false})
+	call(t, off, "POST", "/api/v1/strategy", `{"strategy":"revision_aware"}`)
+	for _, body := range []string{oldToken, strong} {
+		if code, _ := call(t, off, "POST", "/api/v1/check", body); code != http.StatusNotFound {
+			t.Errorf("flag off: check %s = %d, want 404", body, code)
+		}
+	}
+
+	on := serve(t, features.Flags{ClientVersionToken: true})
+	call(t, on, "POST", "/api/v1/strategy", `{"strategy":"revision_aware"}`)
+	call(t, on, "POST", "/api/v1/check", alice)  // caches ALLOW at rev 3
+	call(t, on, "POST", "/api/v1/revoke", alice) // doc:42 → ver#4
+	_, r := call(t, on, "POST", "/api/v1/check", oldToken)
+	if r["decision"] != "ALLOW" || r["servedBy"] != "cache" || r["contractMet"] != true || r["correct"] != false {
+		t.Errorf("old token: %v via %v contractMet=%v correct=%v, want a cached ALLOW that meets the contract but is not the latest", r["decision"], r["servedBy"], r["contractMet"], r["correct"])
+	}
+	_, r = call(t, on, "POST", "/api/v1/check", strong)
+	if r["decision"] != "DENY" || r["servedBy"] != "primary" || r["consistency"] != "fully_consistent" {
+		t.Errorf("fully consistent: %v via %v (%v), want DENY from SQLite", r["decision"], r["servedBy"], r["consistency"])
+	}
+	if code, _ := call(t, on, "POST", "/api/v1/check", `{"subject":"user:alice","object":"doc:42","token":99}`); code != http.StatusBadRequest {
+		t.Errorf("token from the future = %d, want 400", code)
+	}
+	call(t, on, "POST", "/api/v1/strategy", `{"strategy":"ttl"}`)
+	if code, _ := call(t, on, "POST", "/api/v1/check", oldToken); code != http.StatusBadRequest {
+		t.Errorf("token with the TTL strategy = %d, want 400", code)
+	}
+}

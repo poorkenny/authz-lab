@@ -46,7 +46,7 @@ export function shortLabel(h: Hop, i: number, hops: Hop[]): string {
   if (k === "client>checkapi") return "request";
   if (k === "checkapi>client") return "response";
   if (k === "cache>checkapi") return "revision check";
-  if (k === "checkapi>primary") return h.kind === "fallback" ? "fallback to SQLite" : "SQLite query";
+  if (k === "checkapi>primary") return h.kind === "fallback" ? "fallback to SQLite" : h.kind === "strong" ? "fully consistent read" : "SQLite query";
   if (k === "checkapi>cache") return hops.slice(0, i).some((p) => p.from === "checkapi" && p.to === "cache") ? "cache refresh" : "cache lookup";
   if (k === "admin>primary") return "SQLite commit";
   if (k === "primary>queue") return h.kind === "async" ? "enqueue invalidation" : "no invalidation";

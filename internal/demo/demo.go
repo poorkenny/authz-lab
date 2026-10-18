@@ -65,7 +65,7 @@ type Hop struct {
 	To    string  `json:"to"`
 	Label string  `json:"label"`
 	Ms    float64 `json:"ms"`
-	// Kind is "ok", "stale", "fallback", "async", "none" or "" for neutral.
+	// Kind is "ok", "stale", "fallback", "async", "none", "strong" or "" for neutral.
 	Kind string `json:"kind,omitempty"`
 }
 
@@ -90,6 +90,10 @@ type Options struct {
 	// EnforceTTL expires cache entries CacheTTLSec after they were cached, on
 	// a simulated clock that Advance can fast-forward (strategy-stories flag).
 	EnforceTTL bool
+	// ClientTokens lets a revision-aware check carry the client's own version
+	// token, which may be older than the latest, or ask for a fully
+	// consistent read (client-version-token flag).
+	ClientTokens bool
 	// HappyPath adds, to an invalidation-strategy read made while the user's
 	// invalidation is still queued, the result the read would have had if the
 	// event had been delivered first (happy-path-comparison flag).
@@ -339,6 +343,29 @@ type CheckResult struct {
 	// HappyPath is what this read would have returned had the pending
 	// invalidation been delivered first (invalidation strategy, HappyPath on).
 	HappyPath *HappyPath `json:"happyPath,omitempty"`
+	// Revision-aware only. TokenSource is "latest" when the check used the
+	// document's latest version token and "client" when the request carried
+	// its own. Consistency is "at_least_as_fresh" or "fully_consistent".
+	TokenSource string `json:"tokenSource,omitempty"`
+	Consistency string `json:"consistency,omitempty"`
+	// LatestToken is the document's latest version token.
+	LatestToken int64 `json:"latestToken,omitempty"`
+	// EvaluatedRev is the revision the decision reflects: the cache entry's
+	// revision on a hit, SQLite's on a read from the primary.
+	EvaluatedRev int64 `json:"evaluatedRev"`
+	// ContractMet: the decision was evaluated at a revision ≥ the token in
+	// the request (the revision-aware promise; not a promise of the latest).
+	ContractMet bool `json:"contractMet"`
+}
+
+// CheckOpts are request options of the revision-aware strategy.
+type CheckOpts struct {
+	// Token is the document version token the client sends; 0 means the
+	// latest version (the token the client would get by reading the doc now).
+	Token int64
+	// FullyConsistent skips the cache and evaluates at SQLite's latest
+	// revision: always the latest decision, never served from the cache.
+	FullyConsistent bool
 }
 
 // HappyPath is the result of the same check on the happy path: the
@@ -363,8 +390,25 @@ func cacheKey(subject, object string) string { return subject + "|view|" + objec
 
 // Check answers "can subject view object?" with the demo's current strategy.
 func (d *Demo) Check(subject, object string) (CheckResult, error) {
+	return d.CheckWith(subject, object, CheckOpts{})
+}
+
+// CheckWith is Check with revision-aware request options.
+func (d *Demo) CheckWith(subject, object string, opts CheckOpts) (CheckResult, error) {
 	if err := validate(subject, object); err != nil {
 		return CheckResult{}, err
+	}
+	if opts != (CheckOpts{}) {
+		switch {
+		case !d.ClientTokens:
+			return CheckResult{}, fmt.Errorf("client version tokens are disabled")
+		case d.Strategy != RevisionAware:
+			return CheckResult{}, fmt.Errorf("a version token or consistency mode is only used by the revision-aware strategy")
+		case opts.Token < 0 || opts.Token > d.Store.Rev():
+			return CheckResult{}, fmt.Errorf("token must be between 1 and the latest revision (%d)", d.Store.Rev())
+		case opts.Token > 0 && opts.FullyConsistent:
+			return CheckResult{}, fmt.Errorf("a fully consistent check takes no token")
+		}
 	}
 	d.seq++
 	truth, err := d.Store.CanView(subject, object)
@@ -379,13 +423,23 @@ func (d *Demo) Check(subject, object string) (CheckResult, error) {
 		// In a real system the token travels with the request (the app read it
 		// along with the document); the simulation looks it up directly, off
 		// the latency path.
-		if r.RequiredRev, err = d.Store.DocRev(object); err != nil {
+		if r.LatestToken, err = d.Store.DocRev(object); err != nil {
 			return CheckResult{}, err
+		}
+		r.RequiredRev, r.TokenSource, r.Consistency = r.LatestToken, "latest", "at_least_as_fresh"
+		if opts.Token > 0 {
+			r.RequiredRev, r.TokenSource = opts.Token, "client"
+		}
+		if opts.FullyConsistent {
+			r.RequiredRev, r.TokenSource, r.Consistency = 0, "", "fully_consistent"
 		}
 	}
 
 	key := cacheKey(subject, object)
 	entry, hit := d.cache[key]
+	if opts.FullyConsistent {
+		hit = false // never consult the cache
+	}
 	expiredNow := false
 	if hit && d.EnforceTTL && d.age(entry) >= CacheTTLSec {
 		// Lazily evict an entry whose TTL ran out since it was cached.
@@ -407,7 +461,9 @@ func (d *Demo) Check(subject, object string) (CheckResult, error) {
 	} else if expiredNow || d.expired[key] {
 		lookup = fmt.Sprintf("miss (expired after the %d s TTL)", CacheTTLSec)
 	}
-	hop(Hop{From: "checkapi", To: "cache", Label: "lookup → " + lookup, Ms: CacheHitMs})
+	if !opts.FullyConsistent {
+		hop(Hop{From: "checkapi", To: "cache", Label: "lookup → " + lookup, Ms: CacheHitMs})
+	}
 
 	serveCache := hit && (d.Strategy != RevisionAware || entry.Rev >= r.RequiredRev)
 	if hit && d.Strategy == RevisionAware {
@@ -415,12 +471,20 @@ func (d *Demo) Check(subject, object string) (CheckResult, error) {
 		if !serveCache {
 			verdict, kind = "stale", "fallback"
 		}
-		hop(Hop{From: "cache", To: "checkapi", Label: fmt.Sprintf("compare entry rev %d with %s ver#%d → %s", entry.Rev, object, r.RequiredRev, verdict), Ms: RevCompareMs, Kind: kind})
+		with := fmt.Sprintf("%s ver#%d", object, r.RequiredRev)
+		if r.TokenSource == "client" {
+			with = fmt.Sprintf("request token ver#%d", r.RequiredRev)
+		}
+		hop(Hop{From: "cache", To: "checkapi", Label: fmt.Sprintf("compare entry rev %d with %s → %s", entry.Rev, with, verdict), Ms: RevCompareMs, Kind: kind})
 	}
 
 	if serveCache {
-		r.ServedBy, r.Decision = "cache", entry.Decision
+		r.ServedBy, r.Decision, r.EvaluatedRev = "cache", entry.Decision, entry.Rev
 		switch {
+		case d.Strategy == RevisionAware && r.TokenSource == "client" && entry.Rev < r.LatestToken:
+			r.Reason = fmt.Sprintf("Cache entry rev %d ≥ request token ver#%d, so it is served: the promise is kept. But %s is already at ver#%d, where SQLite says %s. The result is at least as fresh as the client asked for, not necessarily the latest.", entry.Rev, r.RequiredRev, object, r.LatestToken, r.Expected)
+		case d.Strategy == RevisionAware && r.TokenSource == "client":
+			r.Reason = fmt.Sprintf("Cache entry rev %d ≥ request token ver#%d, and %s has not changed since (latest ver#%d), so it is safe to serve.", entry.Rev, r.RequiredRev, object, r.LatestToken)
 		case d.Strategy == RevisionAware:
 			r.Reason = fmt.Sprintf("Cache entry rev %d ≥ %s ver#%d: it already reflects the latest ACL change, so it is safe to serve.", entry.Rev, object, r.RequiredRev)
 		case r.Pending != nil && entry.Decision != r.Expected:
@@ -433,9 +497,14 @@ func (d *Demo) Check(subject, object string) (CheckResult, error) {
 			r.Reason = fmt.Sprintf("Cache hit (computed at rev %d, TTL %d s): served without asking SQLite.", entry.Rev, CacheTTLSec)
 		}
 	} else {
-		r.ServedBy, r.Decision = "primary", decision(truth)
+		r.ServedBy, r.Decision, r.EvaluatedRev = "primary", decision(truth), r.PrimaryRev
 		kind := ""
 		switch {
+		case opts.FullyConsistent:
+			r.Reason = fmt.Sprintf("Fully consistent: the cache is skipped and SQLite answers at its latest revision (rev %d). Always the latest decision, but every check pays the primary round trip and adds load to the single source of truth.", r.PrimaryRev)
+		case hit && r.TokenSource == "client":
+			kind = "fallback"
+			r.Reason = fmt.Sprintf("Cache entry rev %d < request token ver#%d: older than the client's token, so the check fell back to SQLite and refreshed the cache.", entry.Rev, r.RequiredRev)
 		case hit:
 			kind = "fallback"
 			r.Reason = fmt.Sprintf("Cache entry rev %d < %s ver#%d: it predates the last ACL change, so the check fell back to SQLite and refreshed the cache.", entry.Rev, object, r.RequiredRev)
@@ -446,12 +515,17 @@ func (d *Demo) Check(subject, object string) (CheckResult, error) {
 		default:
 			r.Reason = "Cache miss: evaluated in SQLite and cached."
 		}
-		hop(Hop{From: "checkapi", To: "primary", Label: fmt.Sprintf("SQLite query at rev %d → %s", r.PrimaryRev, r.Decision), Ms: PrimaryMs, Kind: kind})
-		hop(Hop{From: "checkapi", To: "cache", Label: fmt.Sprintf("refresh: %s @ rev %d", r.Decision, r.PrimaryRev), Ms: CacheFillMs})
-		d.cache[key] = CacheEntry{Subject: subject, Object: object, Decision: r.Decision, Rev: r.PrimaryRev, CachedAt: d.clock()}
-		delete(d.invalidated, key)
-		delete(d.expired, key)
+		if opts.FullyConsistent {
+			hop(Hop{From: "checkapi", To: "primary", Label: fmt.Sprintf("fully consistent: skip the cache, SQLite at latest rev %d → %s", r.PrimaryRev, r.Decision), Ms: PrimaryMs, Kind: "strong"})
+		} else {
+			hop(Hop{From: "checkapi", To: "primary", Label: fmt.Sprintf("SQLite query at rev %d → %s", r.PrimaryRev, r.Decision), Ms: PrimaryMs, Kind: kind})
+			hop(Hop{From: "checkapi", To: "cache", Label: fmt.Sprintf("refresh: %s @ rev %d", r.Decision, r.PrimaryRev), Ms: CacheFillMs})
+			d.cache[key] = CacheEntry{Subject: subject, Object: object, Decision: r.Decision, Rev: r.PrimaryRev, CachedAt: d.clock()}
+			delete(d.invalidated, key)
+			delete(d.expired, key)
+		}
 	}
+	r.ContractMet = d.Strategy == RevisionAware && r.EvaluatedRev >= r.RequiredRev
 	r.Correct = r.Decision == r.Expected
 	hop(Hop{From: "checkapi", To: "client", Label: r.Decision, Ms: NetworkMs, Kind: map[bool]string{true: "ok", false: "stale"}[r.Correct]})
 	if d.HappyPath && d.Strategy == Invalidation && r.Pending != nil {

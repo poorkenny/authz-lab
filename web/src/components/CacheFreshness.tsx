@@ -4,11 +4,11 @@ import type { State, Strategy } from "../types";
 const who = (s: string) => s.replace("user:", "");
 const secs = (n: number) => `${Math.max(0, Math.floor(n))} s`;
 
-// What happens to a stale entry under each strategy.
-const STALE_FATE: Record<Strategy, string> = {
-  ttl: "served until it expires",
-  invalidation: "served until its invalidation is delivered (or it expires)",
-  revision_aware: "never served: the revision token forces a fallback",
+// What happens to a stale entry (cached at rev) under each strategy.
+const STALE_FATE: Record<Strategy, (rev: number) => string> = {
+  ttl: () => "served until it expires",
+  invalidation: () => "served until its invalidation is delivered (or it expires)",
+  revision_aware: (rev) => `served only to requests whose token is ≤ ver#${rev}; the latest token forces a fallback`,
 };
 
 // CacheFreshness shows the cache's TTL config and how fresh each entry is:
@@ -65,7 +65,7 @@ export function CacheFreshness({ state, highlight }: { state: State; highlight: 
                     <td className="mono num">{secs(e.ageSec + elapsed)}</td>
                     <td className="mono num">{left > 0 ? secs(left) : "expired"}</td>
                     <td className={stale ? "txt-bad" : "txt-ok"}>
-                      {stale ? `✕ stale: doc changed at rev ${docRev}; ${STALE_FATE[state.strategy]}` : "✓ fresh: matches SQLite"}
+                      {stale ? `✕ stale: doc changed at rev ${docRev}; ${STALE_FATE[state.strategy](e.rev)}` : "✓ fresh: matches SQLite"}
                     </td>
                   </tr>
                 );

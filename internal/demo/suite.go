@@ -33,6 +33,9 @@ type PropertyStats struct {
 	Writes     int                         `json:"writes"`
 	Deliveries int                         `json:"deliveries"`
 	ByStrat    map[Strategy]*StrategyStats `json:"byStrategy"`
+	// FullyConsistent is the same workload checked with fully consistent
+	// reads (revision-aware strategy, every check on SQLite).
+	FullyConsistent *StrategyStats `json:"fullyConsistent"`
 }
 
 type SuiteResult struct {
@@ -189,7 +192,57 @@ func scenarioCases() ([]TestCase, error) {
 		"The fallback refreshed the cache at rev 4, so the next check is a fast, correct cache hit.",
 		raAfter.Correct && raAfter.ServedBy == "cache",
 		describe(raAfter))
+	tok, err := tokenStory()
+	if err != nil {
+		return nil, err
+	}
+	add(RevisionAware, "Revision-aware: an old token in the request can still read a result that is not the latest",
+		fmt.Sprintf("Alice's client read doc:42 at ver#%d and still sends that token after the revoke moved the doc to ver#%d. The cached ALLOW (rev %d) satisfies the token, so it is served: the promise (evaluated at a version ≥ the token) is kept, but the result is not the latest.", tok.old.RequiredRev, tok.old.LatestToken, tok.old.CacheRev),
+		tok.old.TokenSource == "client" && tok.old.ServedBy == "cache" && tok.old.Decision == "ALLOW" && tok.old.Expected == "DENY" && tok.old.ContractMet,
+		describe(tok.old), fmt.Sprintf("evaluated at rev %d ≥ request token ver#%d; latest ver#%d", tok.old.EvaluatedRev, tok.old.RequiredRev, tok.old.LatestToken))
+	add(RevisionAware, "Revision-aware: the latest token makes the same check fresh",
+		"With doc:42's latest token, the cached entry is too old, so the check falls back to SQLite and answers DENY.",
+		tok.latest.Correct && tok.latest.Decision == "DENY" && tok.latest.ServedBy == "primary" && tok.latest.ContractMet,
+		describe(tok.latest))
+	strongNoCache := true
+	for _, h := range tok.strong.Hops {
+		strongNoCache = strongNoCache && h.To != "cache" && h.From != "cache"
+	}
+	add(RevisionAware, "Fully consistent: always the latest, never from the cache",
+		fmt.Sprintf("A fully consistent check skips the cache and asks SQLite at its latest revision: correct, at %.1f ms instead of %.1f ms for a cache hit.", tok.strong.LatencyMs, 2*NetworkMs+CacheHitMs),
+		tok.strong.Correct && tok.strong.ServedBy == "primary" && tok.strong.Consistency == "fully_consistent" && strongNoCache,
+		describe(tok.strong))
 	return cases, nil
+}
+
+type tokenResults struct{ old, latest, strong CheckResult }
+
+// tokenStory: Alice reads doc:42 (her client keeps the doc's token), the
+// admin revokes her, then her client checks with that old token, with the
+// latest token, and fully consistently.
+func tokenStory() (tokenResults, error) {
+	var out tokenResults
+	d, err := New(RevisionAware)
+	if err != nil {
+		return out, err
+	}
+	defer d.Close()
+	d.ClientTokens = true
+	first, err := d.Check("user:alice", "doc:42")
+	if err != nil {
+		return out, err
+	}
+	if _, err := d.Revoke("user:alice", "doc:42"); err != nil {
+		return out, err
+	}
+	if out.old, err = d.CheckWith("user:alice", "doc:42", CheckOpts{Token: first.LatestToken}); err != nil {
+		return out, err
+	}
+	if out.strong, err = d.CheckWith("user:alice", "doc:42", CheckOpts{FullyConsistent: true}); err != nil {
+		return out, err
+	}
+	out.latest, err = d.Check("user:alice", "doc:42")
+	return out, err
 }
 
 // ttlEdge reads a stale entry one second before and exactly at its TTL, on a frozen clock.
@@ -232,6 +285,14 @@ func propertyRun(seed uint64, ops int, ps *PropertyStats) error {
 		defer d.Close()
 		demos[i] = d
 	}
+	// The same workload, checked fully consistently.
+	strong, err := New(RevisionAware)
+	if err != nil {
+		return err
+	}
+	defer strong.Close()
+	strong.ClientTokens = true
+	all := append(demos[:len(demos):len(demos)], strong)
 	viewers := map[string]bool{"user:alice|doc:42": true}
 
 	for range ops {
@@ -242,7 +303,7 @@ func propertyRun(seed uint64, ops int, ps *PropertyStats) error {
 		switch {
 		case r < 0.05 && !viewers[key]:
 			viewers[key] = true
-			for _, d := range demos {
+			for _, d := range all {
 				if _, err := d.Grant(u, doc); err != nil {
 					return err
 				}
@@ -250,7 +311,7 @@ func propertyRun(seed uint64, ops int, ps *PropertyStats) error {
 			ps.Writes++
 		case r < 0.10 && viewers[key]:
 			delete(viewers, key)
-			for _, d := range demos {
+			for _, d := range all {
 				if _, err := d.Revoke(u, doc); err != nil {
 					return err
 				}
@@ -264,6 +325,19 @@ func propertyRun(seed uint64, ops int, ps *PropertyStats) error {
 				}
 			}
 		default:
+			res, err := strong.CheckWith(u, doc, CheckOpts{FullyConsistent: true})
+			if err != nil {
+				return err
+			}
+			fc := ps.FullyConsistent
+			fc.Checks++
+			fc.MeanMs += res.LatencyMs
+			if !res.Correct {
+				fc.Wrong++
+			}
+			if res.ServedBy == "cache" {
+				fc.CacheHits++
+			}
 			for _, d := range demos {
 				res, err := d.Check(u, doc)
 				if err != nil {
@@ -294,7 +368,7 @@ func propertyRun(seed uint64, ops int, ps *PropertyStats) error {
 }
 
 func propertyCases() ([]TestCase, PropertyStats, error) {
-	ps := PropertyStats{Seeds: 30, OpsPerRun: 400, ByStrat: map[Strategy]*StrategyStats{}}
+	ps := PropertyStats{Seeds: 30, OpsPerRun: 400, ByStrat: map[Strategy]*StrategyStats{}, FullyConsistent: &StrategyStats{}}
 	for _, s := range Strategies {
 		ps.ByStrat[s] = &StrategyStats{}
 	}
@@ -303,7 +377,7 @@ func propertyCases() ([]TestCase, PropertyStats, error) {
 			return nil, ps, err
 		}
 	}
-	for _, s := range ps.ByStrat {
+	for _, s := range append([]*StrategyStats{ps.FullyConsistent}, values(ps.ByStrat)...) {
 		if s.Checks > 0 {
 			s.MeanMs /= float64(s.Checks)
 			s.HitRatePct = 100 * float64(s.CacheHits) / float64(s.Checks)
@@ -314,12 +388,12 @@ func propertyCases() ([]TestCase, PropertyStats, error) {
 		return fmt.Sprintf("%s: %d checks, %d wrong (%d stale ALLOWs, %d while the invalidation was queued), cache hit rate %.1f%%, %d fallbacks, mean latency %.2f ms",
 			s, st.Checks, st.Wrong, st.StaleAllows, st.InWindow, st.HitRatePct, st.Fallbacks, st.MeanMs)
 	}
-	ttl, inv, ra := ps.ByStrat[TTL], ps.ByStrat[Invalidation], ps.ByStrat[RevisionAware]
+	ttl, inv, ra, fc := ps.ByStrat[TTL], ps.ByStrat[Invalidation], ps.ByStrat[RevisionAware], ps.FullyConsistent
 	workload := fmt.Sprintf("%d random workloads × %d operations (grants, revokes, invalidation deliveries and checks for %d users on %d documents)", ps.Seeds, ps.OpsPerRun, len(Users), len(Docs))
 	cases := []TestCase{
 		{
 			Name: "Property: revision-aware decisions always match SQLite", Kind: "property", Strategy: RevisionAware,
-			Description: workload + ". Every revision-aware decision must equal SQLite's at the moment of the check.",
+			Description: workload + ". Every check carries the document's latest version token, and every revision-aware decision must equal SQLite's at the moment of the check.",
 			Passed:      ra.Checks > 0 && ra.Wrong == 0,
 			Details:     []string{summary(RevisionAware)},
 		},
@@ -330,6 +404,12 @@ func propertyCases() ([]TestCase, PropertyStats, error) {
 			Details:     []string{summary(Invalidation)},
 		},
 		{
+			Name: "Property: fully consistent reads are always correct, but never use the cache", Kind: "property", Strategy: RevisionAware,
+			Description: "The same workloads, checked fully consistently: every decision matches SQLite, but the cache hit rate is 0% and every check pays the primary round trip. Latest-ness costs scalability.",
+			Passed:      fc.Checks > 0 && fc.Wrong == 0 && fc.CacheHits == 0 && fc.MeanMs > ra.MeanMs,
+			Details:     []string{fmt.Sprintf("fully consistent: %d checks, %d wrong, cache hit rate %.1f%%, mean latency %.2f ms (revision-aware: %.2f ms)", fc.Checks, fc.Wrong, fc.HitRatePct, fc.MeanMs, ra.MeanMs)},
+		},
+		{
 			Name: "Property sanity: the same workloads catch the TTL cache", Kind: "property", Strategy: TTL,
 			Description: "A test that can't fail proves nothing. The identical workloads must detect stale decisions in the TTL cache.",
 			Passed:      ttl.StaleAllows > 0,
@@ -337,6 +417,14 @@ func propertyCases() ([]TestCase, PropertyStats, error) {
 		},
 	}
 	return cases, ps, nil
+}
+
+func values(m map[Strategy]*StrategyStats) []*StrategyStats {
+	var out []*StrategyStats
+	for _, s := range Strategies {
+		out = append(out, m[s])
+	}
+	return out
 }
 
 // RunSuite runs every correctness test.

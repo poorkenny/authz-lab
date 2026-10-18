@@ -7,6 +7,7 @@ export interface Features {
   controlledCacheDelivery: boolean;
   strategyStories: boolean;
   happyPathComparison: boolean;
+  clientVersionToken: boolean;
 }
 
 export interface Hop {
@@ -14,7 +15,7 @@ export interface Hop {
   to: string;
   label: string;
   ms: number;
-  kind?: "ok" | "stale" | "fallback" | "async" | "none";
+  kind?: "ok" | "stale" | "fallback" | "async" | "none" | "strong";
 }
 
 export interface QueueMsg {
@@ -47,6 +48,18 @@ export interface CheckResult {
   entryAgeSec: number;
   ttlSec: number;
   happyPath?: HappyPath;
+  // Revision-aware only.
+  tokenSource?: "latest" | "client";
+  consistency?: "at_least_as_fresh" | "fully_consistent";
+  latestToken?: number;
+  evaluatedRev: number;
+  contractMet: boolean;
+}
+
+// Revision-aware request options (FEATURE_CLIENT_VERSION_TOKEN).
+export interface CheckOpts {
+  token?: number;
+  consistency?: "fully_consistent";
 }
 
 // The same check on the happy path: the queued invalidation was delivered first.

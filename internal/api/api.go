@@ -130,9 +130,10 @@ func (s *Server) newDemo(st demo.Strategy) (*demo.Demo, error) {
 // options maps the feature flags onto demo behaviours.
 func (s *Server) options() demo.Options {
 	return demo.Options{
-		AutoDeliver: !s.flags.ControlledCacheDelivery,
-		EnforceTTL:  s.flags.StrategyStories,
-		HappyPath:   s.flags.HappyPathComparison,
+		AutoDeliver:  !s.flags.ControlledCacheDelivery,
+		EnforceTTL:   s.flags.StrategyStories,
+		HappyPath:    s.flags.HappyPathComparison,
+		ClientTokens: s.flags.ClientVersionToken,
 	}
 }
 
@@ -190,7 +191,10 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			return withPair(r, (*d).Revoke)
 		}))
 		mux.HandleFunc("POST "+prefix+"/check", s.with(wd, func(r *http.Request, d **demo.Demo) (any, error) {
-			return withPair(r, (*d).Check)
+			if wd == simWorld {
+				return withPair(r, (*d).Check)
+			}
+			return s.check(r, *d)
 		}))
 		mux.HandleFunc("POST "+prefix+"/deliver", s.with(wd, func(r *http.Request, d **demo.Demo) (any, error) {
 			if err := s.requireControlledDelivery(); err != nil {
@@ -342,6 +346,36 @@ func (s *Server) reset(d **demo.Demo, st demo.Strategy, main bool) (any, error) 
 	(*d).Close()
 	*d = fresh
 	return fresh.State()
+}
+
+// check handles a main-demo check, which may carry revision-aware options:
+// the client's version token, or "consistency": "fully_consistent".
+func (s *Server) check(r *http.Request, d *demo.Demo) (any, error) {
+	var req struct {
+		Subject     string `json:"subject"`
+		Object      string `json:"object"`
+		Token       int64  `json:"token"`
+		Consistency string `json:"consistency"`
+	}
+	if err := decode(r, &req); err != nil {
+		return nil, err
+	}
+	opts := demo.CheckOpts{Token: req.Token}
+	switch req.Consistency {
+	case "", "at_least_as_fresh":
+	case "fully_consistent":
+		opts.FullyConsistent = true
+	default:
+		return nil, badRequest(errors.New(`consistency must be "at_least_as_fresh" or "fully_consistent"`))
+	}
+	if opts != (demo.CheckOpts{}) && !s.flags.ClientVersionToken {
+		return nil, httpError{http.StatusNotFound, "client version tokens are disabled (FEATURE_CLIENT_VERSION_TOKEN=false)"}
+	}
+	out, err := d.CheckWith(req.Subject, req.Object, opts)
+	if err != nil {
+		return nil, badRequest(err)
+	}
+	return out, nil
 }
 
 func withPair[T any](r *http.Request, f func(subject, object string) (T, error)) (any, error) {
