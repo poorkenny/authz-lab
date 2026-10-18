@@ -296,8 +296,8 @@ export default function App() {
                 <p>{lastEntry.r.reason}</p>
                 <p className="mono small">
                   served by {lastEntry.r.servedBy} · cache entry rev {lastEntry.r.cacheRev || "—"}
-                  {stories && lastEntry.r.servedBy === "cache" && <> (age {Math.floor(lastEntry.r.entryAgeSec)} s of {lastEntry.r.ttlSec} s TTL)</>} · revision token{" "}
-                  {lastEntry.r.requiredRev || "not used"} · SQLite rev {lastEntry.r.primaryRev} · {fmtMs(lastEntry.r.latencyMs)} ms
+                  {stories && lastEntry.r.servedBy === "cache" && <> (age {Math.floor(lastEntry.r.entryAgeSec)} s of {lastEntry.r.ttlSec} s TTL)</>} · doc version token{" "}
+                  {lastEntry.r.requiredRev ? `${lastEntry.r.object} ver#${lastEntry.r.requiredRev}` : "not used"} · SQLite rev {lastEntry.r.primaryRev} · {fmtMs(lastEntry.r.latencyMs)} ms
                 </p>
                 {lastEntry.r.happyPath && <HappyPathCompare r={lastEntry.r} />}
               </div>

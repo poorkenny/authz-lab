@@ -32,7 +32,7 @@ Each strategy has its own story (flag `FEATURE_STRATEGY_STORIES`). Every run is 
 | Step | TTL cache | TTL + invalidation | Revision-aware |
 |---|---|---|---|
 | 1 | Alice opens doc:42: cache miss → SQLite → ALLOW cached at rev 3 | same | same |
-| 2 | Admin revokes Alice (SQLite rev 4); nothing tells the cache | Admin revokes Alice; invalidation #1 is queued | Admin revokes Alice; doc:42's revision token becomes 4 |
+| 2 | Admin revokes Alice (SQLite rev 4); nothing tells the cache | Admin revokes Alice; invalidation #1 is queued | Admin revokes Alice; doc:42's revision token becomes ver#4 |
 | 3 | **Alice reads within the TTL** (repeatable): stale ALLOW; the freshness panel shows the entry's age and time left | **Check before delivery** (repeatable, also as Bob): each read shows its result **next to the happy path** (event delivered first) | Alice reads after the revoke: fallback to SQLite, DENY |
 | 4 | **Fast-forward 300 s**: the entry reaches its TTL and is evicted | **Deliver the invalidation event** (manual) | Alice reads again: fresh cache hit |
 | 5 | Alice reads after the TTL: DENY from SQLite | Alice reads after delivery: DENY from SQLite | |

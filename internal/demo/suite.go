@@ -182,7 +182,7 @@ func scenarioCases() ([]TestCase, error) {
 		return nil, err
 	}
 	add(RevisionAware, "Revision-aware is correct before any delivery",
-		"The cached ALLOW (rev 3) is older than doc:42's token (rev 4), so the check falls back to SQLite and answers DENY. No invalidation is needed.",
+		"The cached ALLOW (rev 3) is older than doc:42's token (ver#4), so the check falls back to SQLite and answers DENY. No invalidation is needed.",
 		raBefore.Correct && raBefore.Decision == "DENY" && raBefore.ServedBy == "primary",
 		describe(raBefore))
 	add(RevisionAware, "Revision-aware pays the fallback once, then hits the cache again",
