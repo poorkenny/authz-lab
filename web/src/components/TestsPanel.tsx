@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { api } from "../api";
+import { ApiError, api } from "../api";
 import type { StrategyStats, SuiteResult } from "../types";
 import { STRATEGIES, byId } from "../strategies";
 
@@ -7,14 +7,18 @@ export function TestsPanel({ section }: { section: number }) {
   const [result, setResult] = useState<SuiteResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
 
   async function run() {
     setBusy(true);
     setError("");
+    setNotice("");
     try {
       setResult(await api.runTests());
     } catch (e) {
-      setError((e as Error).message);
+      // 409: another reviewer's run is in progress (one run at a time per server).
+      if (e instanceof ApiError && e.status === 409) setNotice(e.message);
+      else setError((e as Error).message);
     } finally {
       setBusy(false);
     }
@@ -40,6 +44,11 @@ export function TestsPanel({ section }: { section: number }) {
       <button className="primary-btn" onClick={run} disabled={busy}>
         {busy ? "Running…" : result ? "Run again" : "Run correctness tests"}
       </button>
+      {notice && (
+        <p className="sim-note" role="status">
+          {notice}
+        </p>
+      )}
       {error && <p className="txt-bad">{error}</p>}
 
       {result && (

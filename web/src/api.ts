@@ -19,6 +19,16 @@ function sessionId(): string {
   }
 }
 
+// ApiError carries the HTTP status so callers can tell "busy" (409) from failures.
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+  }
+}
+
 async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, {
     method,
@@ -26,7 +36,7 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error ?? `${res.status} ${res.statusText}`);
+  if (!res.ok) throw new ApiError(data.error ?? `${res.status} ${res.statusText}`, res.status);
   return data as T;
 }
 

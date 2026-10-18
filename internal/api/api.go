@@ -53,6 +53,9 @@ type Server struct {
 	mu       sync.Mutex
 	sessions map[string]*session
 	flags    features.Flags
+	// testRun allows one correctness-suite run at a time across all sessions,
+	// so concurrent reviewers can't exhaust a small (free-tier) instance.
+	testRun sync.Mutex
 }
 
 func NewServer(flags features.Flags) *Server {
@@ -228,6 +231,11 @@ func (s *Server) Routes(mux *http.ServeMux) {
 		return map[string]any{"records": (*d).Audit.Query(audit.Filter{Limit: 200, StaleOnly: r.URL.Query().Get("stale") == "true"})}, nil
 	}))
 	mux.HandleFunc("POST /api/v1/tests/run", s.with(mainWorld, func(r *http.Request, _ **demo.Demo) (any, error) {
+		// Reject instead of waiting, so requests can't pile up behind a run.
+		if !s.testRun.TryLock() {
+			return nil, httpError{http.StatusConflict, "Another correctness test run is in progress on this server. Try again in a few seconds."}
+		}
+		defer s.testRun.Unlock()
 		return demo.RunSuite()
 	}))
 }

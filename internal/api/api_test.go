@@ -65,3 +65,22 @@ func TestControlledCacheDeliveryFlag(t *testing.T) {
 		t.Errorf("flag on: read before delivery = %v, want stale ALLOW", r["decision"])
 	}
 }
+
+func TestOnlyOneTestRunAtATime(t *testing.T) {
+	s := NewServer(features.Defaults())
+	mux := http.NewServeMux()
+	s.Routes(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// Simulate a run in progress (from any session).
+	s.testRun.Lock()
+	if code, body := call(t, srv, "POST", "/api/v1/tests/run", ""); code != http.StatusConflict {
+		t.Fatalf("second run while one is in progress: got %d %v, want 409", code, body)
+	}
+	s.testRun.Unlock()
+
+	if code, body := call(t, srv, "POST", "/api/v1/tests/run", ""); code != http.StatusOK || body["passed"] != true {
+		t.Fatalf("run after the lock is released: got %d passed=%v, want 200 and passed", code, body["passed"])
+	}
+}

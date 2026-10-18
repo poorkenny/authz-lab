@@ -15,6 +15,7 @@ Every feature of the demo ships behind a **feature flag**, so it can be released
 | Flag | Default | Status | Since |
 |---|---|---|---|
 | [`FEATURE_CONTROLLED_CACHE_DELIVERY`](#feature_controlled_cache_delivery) | `true` (enabled) | Released | PR #4 |
+| `FEATURE_AUTH` | `false` | Planned: authentication and user management (see [TODO.md](../TODO.md)) | not implemented |
 
 ## How to enable / disable a flag
 
