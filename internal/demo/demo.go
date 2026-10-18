@@ -265,8 +265,8 @@ func (d *Demo) change(op store.Op, subject, object string) (WriteResult, error) 
 			r.Note = fmt.Sprintf("Committed to SQLite at rev %d. Invalidation #%d was delivered automatically right after the commit: %s", c.Rev, m.ID, dr.Note)
 		}
 	case RevisionAware:
-		r.Note = fmt.Sprintf("Committed to SQLite at rev %d. %s's revision token is now %d; requests carry it, so the cache needs no invalidation.", c.Rev, object, c.Rev)
-		r.Hops = append(r.Hops, Hop{From: "primary", To: "queue", Label: fmt.Sprintf("no invalidation needed: token for %s is now %d", object, c.Rev), Kind: "none"})
+		r.Note = fmt.Sprintf("Committed to SQLite at rev %d. %s's revision token is now ver#%d; requests carry it, so the cache needs no invalidation.", c.Rev, object, c.Rev)
+		r.Hops = append(r.Hops, Hop{From: "primary", To: "queue", Label: fmt.Sprintf("no invalidation needed: %s is now ver#%d", object, c.Rev), Kind: "none"})
 	}
 	d.Audit.Append(audit.Record{ID: fmt.Sprintf("w%d", d.seq), T: int64(d.seq), Kind: "write", Tuple: t.String(), Op: string(op), Rev: c.Rev, PrimaryRev: c.Rev, Path: string(d.Strategy)})
 	return r, nil
@@ -415,14 +415,14 @@ func (d *Demo) Check(subject, object string) (CheckResult, error) {
 		if !serveCache {
 			verdict, kind = "stale", "fallback"
 		}
-		hop(Hop{From: "cache", To: "checkapi", Label: fmt.Sprintf("compare entry rev %d with token %d → %s", entry.Rev, r.RequiredRev, verdict), Ms: RevCompareMs, Kind: kind})
+		hop(Hop{From: "cache", To: "checkapi", Label: fmt.Sprintf("compare entry rev %d with %s ver#%d → %s", entry.Rev, object, r.RequiredRev, verdict), Ms: RevCompareMs, Kind: kind})
 	}
 
 	if serveCache {
 		r.ServedBy, r.Decision = "cache", entry.Decision
 		switch {
 		case d.Strategy == RevisionAware:
-			r.Reason = fmt.Sprintf("Cache entry rev %d ≥ revision token %d: it already reflects the latest ACL change, so it is safe to serve.", entry.Rev, r.RequiredRev)
+			r.Reason = fmt.Sprintf("Cache entry rev %d ≥ %s ver#%d: it already reflects the latest ACL change, so it is safe to serve.", entry.Rev, object, r.RequiredRev)
 		case r.Pending != nil && entry.Decision != r.Expected:
 			r.Reason = fmt.Sprintf("Read-after-write inconsistency: SQLite committed rev %d, but invalidation #%d is still queued (position %d of %d), so the cache still serves its old entry (rev %d).", r.Pending.Rev, r.Pending.ID, r.PendingPos, r.QueueDepth, entry.Rev)
 		case d.EnforceTTL && entry.Decision != r.Expected:
@@ -438,7 +438,7 @@ func (d *Demo) Check(subject, object string) (CheckResult, error) {
 		switch {
 		case hit:
 			kind = "fallback"
-			r.Reason = fmt.Sprintf("Cache entry rev %d < revision token %d: it predates the last ACL change, so the check fell back to SQLite and refreshed the cache.", entry.Rev, r.RequiredRev)
+			r.Reason = fmt.Sprintf("Cache entry rev %d < %s ver#%d: it predates the last ACL change, so the check fell back to SQLite and refreshed the cache.", entry.Rev, object, r.RequiredRev)
 		case strings.HasPrefix(lookup, "miss (dropped"):
 			r.Reason = "The delivered invalidation removed the old entry, so the check read SQLite and re-cached the fresh decision."
 		case strings.HasPrefix(lookup, "miss (expired"):

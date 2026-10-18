@@ -134,10 +134,10 @@ export function FlowDiagram({ hops: hopsProp, state, actor, onDeliver, busy }: P
                       source of truth · rev {state.primaryRev}
                     </text>
                     <text x={b.x + 12} y={b.y + 64} className="box-sub">
-                      doc:42 revision token = {state.docRev["doc:42"] ?? 0}
+                      doc:42 version token: ver#{state.docRev["doc:42"] ?? 0}
                     </text>
                     <text x={b.x + 12} y={b.y + 84} className="box-sub">
-                      doc:7 revision token = {state.docRev["doc:7"] ?? 0}
+                      doc:7 version token: ver#{state.docRev["doc:7"] ?? 0}
                     </text>
                   </>
                 )}
