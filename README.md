@@ -4,6 +4,7 @@
 
 An interactive lab that walks a reviewer through the problem and its answer, using a mock distributed authorization system (primary store, changelog, watermark fast lane, check replicas, decision caches, audit log) with simulated time, so every run is deterministic and replayable.
 
+[![CI](https://github.com/poorkenny/authz-lab/actions/workflows/ci.yml/badge.svg)](https://github.com/poorkenny/authz-lab/actions/workflows/ci.yml)
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/poorkenny/authz-lab)
 
 ![Guided review: a stale ALLOW caused by replication lag](docs/images/guided-step.png)
