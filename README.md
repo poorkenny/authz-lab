@@ -101,6 +101,7 @@ Every feature ships behind a flag; see **[docs/FEATURES.md](docs/FEATURES.md)** 
 | Flag | Default | Feature |
 |---|---|---|
 | `FEATURE_CONTROLLED_CACHE_DELIVERY` | `true` | Invalidation events wait in the queue until delivered from the UI (deliver step, queue button, section 3 simulation). Off: delivered automatically after each commit. |
+| `FEATURE_AUTH` | `false` | *Planned*: authentication and user management (see [TODO.md](TODO.md)). |
 
 ## Run locally
 
@@ -128,7 +129,7 @@ All endpoints accept an `X-Lab-Session` header. Each session has two worlds, eac
 | `GET /api/v1/compare` | run the five-step story under every strategy |
 | `POST /api/v1/reset` | restore the starting state |
 | `GET /api/v1/audit?stale=true` | audit log of writes and checks |
-| `POST /api/v1/tests/run` | run the correctness suite |
+| `POST /api/v1/tests/run` | run the correctness suite (one run at a time per server; `409` while another run is in progress) |
 | `/api/v1/sim/{state,reset,check,grant,revoke,deliver}` | the same operations on the queue-simulation world (flag `FEATURE_CONTROLLED_CACHE_DELIVERY`) |
 | `POST /api/v1/sim/other-writes {count}` | commit 1–10 unrelated writes, each queueing its own invalidation event |
 
@@ -181,7 +182,7 @@ curl -s -X POST $APP/api/v1/tests/run | head -c 200          # {"passed":true,..
 - `autoDeploy: true`: every push to `main` redeploys (after CI passes on the PR).
 - The free instance **sleeps after ~15 min idle**, and the first request then takes about a minute. Open the URL shortly before a review.
 - **No persistent disk**: each session's SQLite databases live in memory and reset on restart, by design.
-- Safeguards for public access: per-browser sessions (max 500, 30 min idle expiry, database closed on expiry), 10 req/s rate limit per session, 16 KB request bodies, and CSP / frame / nosniff headers.
+- Safeguards for public access: per-browser sessions (max 500, 30 min idle expiry, database closed on expiry), 10 req/s rate limit per session, **one correctness-test run at a time per server** (a concurrent request gets `409` and the UI asks the reviewer to retry), 16 KB request bodies, and CSP / frame / nosniff headers.
 
 Free-tier limits change; check [render.com/pricing](https://render.com/pricing).
 
