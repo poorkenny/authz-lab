@@ -10,15 +10,17 @@ import (
 type TestCase struct {
 	Name        string   `json:"name"`
 	Kind        string   `json:"kind"` // scenario | property
+	Strategy    Strategy `json:"strategy,omitempty"`
 	Description string   `json:"description"`
 	Passed      bool     `json:"passed"`
 	Details     []string `json:"details"`
 }
 
-type ModeStats struct {
+type StrategyStats struct {
 	Checks      int     `json:"checks"`
-	Wrong       int     `json:"wrong"`       // decisions that differ from the primary
-	StaleAllows int     `json:"staleAllows"` // ALLOW where the primary says DENY
+	Wrong       int     `json:"wrong"`       // decisions that differ from SQLite
+	StaleAllows int     `json:"staleAllows"` // ALLOW where SQLite says DENY
+	InWindow    int     `json:"inWindow"`    // wrong decisions made while an invalidation was in flight
 	CacheHits   int     `json:"cacheHits"`
 	Fallbacks   int     `json:"fallbacks"` // stale entries refused (revision-aware only)
 	MeanMs      float64 `json:"meanMs"`
@@ -26,11 +28,10 @@ type ModeStats struct {
 }
 
 type PropertyStats struct {
-	Seeds     int       `json:"seeds"`
-	OpsPerRun int       `json:"opsPerRun"`
-	Writes    int       `json:"writes"`
-	Plain     ModeStats `json:"plain"`
-	Aware     ModeStats `json:"revisionAware"`
+	Seeds     int                         `json:"seeds"`
+	OpsPerRun int                         `json:"opsPerRun"`
+	Writes    int                         `json:"writes"`
+	ByStrat   map[Strategy]*StrategyStats `json:"byStrategy"`
 }
 
 type SuiteResult struct {
@@ -40,166 +41,235 @@ type SuiteResult struct {
 	DurationMs float64       `json:"durationMs"`
 }
 
-// The three-step story: Alice reads (cached ALLOW), the admin revokes her,
-// Alice reads again.
-func story(mode Mode) (first, afterRevoke CheckResult, d *Demo) {
-	d = New(mode)
-	first, _ = d.Check("user:alice", "doc:42")
-	if _, err := d.Revoke("user:alice", "doc:42"); err != nil {
-		panic(err)
+// Story runs the four-step story for one strategy: Alice reads, the admin
+// revokes her, Alice retries 10 ms later (inside the invalidation window),
+// and again 1 s later.
+func Story(s Strategy) (soon, later CheckResult, err error) {
+	d, err := New(s)
+	if err != nil {
+		return
 	}
-	afterRevoke, _ = d.Check("user:alice", "doc:42")
-	return first, afterRevoke, d
+	defer d.Close()
+	if _, err = d.Check("user:alice", "doc:42"); err != nil {
+		return
+	}
+	d.Advance(1000)
+	if _, err = d.Revoke("user:alice", "doc:42"); err != nil {
+		return
+	}
+	d.Advance(10)
+	if soon, err = d.Check("user:alice", "doc:42"); err != nil {
+		return
+	}
+	d.Advance(1000)
+	later, err = d.Check("user:alice", "doc:42")
+	return
 }
 
 func describe(r CheckResult) string {
-	return fmt.Sprintf("%s %s %s → %s (expected %s), served by %s, cache rev %d, token %d, %.2f ms",
-		r.Mode, r.Subject, r.Object, r.Decision, r.Expected, r.ServedBy, r.CacheRev, r.RequiredRev, r.LatencyMs)
+	s := fmt.Sprintf("t=%d ms %s: %s view %s → %s (SQLite says %s), served by %s, %.2f ms", r.T, r.Strategy, r.Subject, r.Object, r.Decision, r.Expected, r.ServedBy, r.LatencyMs)
+	if r.RaceWindow {
+		s += fmt.Sprintf(", invalidation in flight until t=%d ms", r.Invalidation.DeliverAt)
+	}
+	return s
 }
 
-func scenarioCases() []TestCase {
+func scenarioCases() ([]TestCase, error) {
 	var cases []TestCase
-	add := func(name, desc string, passed bool, details ...string) {
-		cases = append(cases, TestCase{Name: name, Kind: "scenario", Description: desc, Passed: passed, Details: details})
+	add := func(s Strategy, name, desc string, passed bool, details ...string) {
+		cases = append(cases, TestCase{Name: name, Kind: "scenario", Strategy: s, Description: desc, Passed: passed, Details: details})
 	}
 
-	_, plainAfter, _ := story(PlainCache)
-	add("Plain cache reproduces the stale ALLOW",
-		"After Alice is revoked, the plain cache still answers ALLOW from its pre-revoke entry. This test passes when the bug is reproduced.",
-		plainAfter.Decision == "ALLOW" && plainAfter.Expected == "DENY" && plainAfter.ServedBy == "cache",
-		describe(plainAfter))
-
-	_, awareAfter, d := story(RevisionAware)
-	add("Revision-aware: revoked user is denied on the very next check",
-		"The cached ALLOW is older than doc:42's revision token, so the check falls back to the primary and returns DENY.",
-		awareAfter.Decision == "DENY" && awareAfter.ServedBy == "primary" && awareAfter.CacheRev < awareAfter.RequiredRev,
-		describe(awareAfter))
-
-	again, _ := d.Check("user:alice", "doc:42")
-	add("Revision-aware: the fallback refreshes the cache",
-		"After one fallback the cache holds DENY at the new revision, so the next check is a fast, correct cache hit.",
-		again.ServedBy == "cache" && again.Decision == "DENY" && again.CacheRev >= again.RequiredRev,
-		describe(again))
-
-	if _, err := d.Grant("user:alice", "doc:42"); err != nil {
-		panic(err)
+	ttlSoon, ttlLater, err := Story(TTL)
+	if err != nil {
+		return nil, err
 	}
-	regrant, _ := d.Check("user:alice", "doc:42")
-	add("Revision-aware: a re-grant is visible immediately",
-		"Stale DENYs are refused too: after re-granting, the cached DENY is older than the token and Alice gets ALLOW.",
-		regrant.Decision == "ALLOW" && regrant.ServedBy == "primary",
+	add(TTL, "TTL cache serves a stale ALLOW for the whole TTL",
+		"After Alice is revoked, the TTL cache answers ALLOW both 10 ms and 1 s later. This test passes when the problem is reproduced.",
+		!ttlSoon.Correct && !ttlLater.Correct && ttlLater.ServedBy == "cache",
+		describe(ttlSoon), describe(ttlLater))
+
+	invSoon, invLater, err := Story(Invalidation)
+	if err != nil {
+		return nil, err
+	}
+	add(Invalidation, "Invalidation still serves a stale ALLOW inside the race window",
+		"A check 10 ms after the SQLite commit lands before the invalidation (80 ms) arrives, so it still hits the old entry. This can't be prevented, only shortened.",
+		!invSoon.Correct && invSoon.RaceWindow && invSoon.ServedBy == "cache",
+		describe(invSoon))
+	add(Invalidation, "Invalidation fixes the cache once it arrives",
+		"1 s later the invalidation has removed the entry, so the check reads SQLite and answers DENY: mitigated, not guaranteed.",
+		invLater.Correct && invLater.Decision == "DENY" && !invLater.RaceWindow,
+		describe(invLater))
+
+	raSoon, raLater, err := Story(RevisionAware)
+	if err != nil {
+		return nil, err
+	}
+	add(RevisionAware, "Revision-aware is correct even inside the race window",
+		"10 ms after the commit the cached ALLOW (rev 3) is older than doc:42's token (rev 4), so the check falls back to SQLite and answers DENY.",
+		raSoon.Correct && raSoon.Decision == "DENY" && raSoon.ServedBy == "primary",
+		describe(raSoon))
+	add(RevisionAware, "Revision-aware pays the fallback once, then hits the cache again",
+		"The fallback refreshed the cache at rev 4, so the next check is a fast, correct cache hit.",
+		raLater.Correct && raLater.ServedBy == "cache",
+		describe(raLater))
+
+	d, err := New(RevisionAware)
+	if err != nil {
+		return nil, err
+	}
+	defer d.Close()
+	d.Check("user:alice", "doc:42")
+	d.Revoke("user:alice", "doc:42")
+	d.Check("user:alice", "doc:42")
+	d.Grant("user:alice", "doc:42")
+	regrant, err := d.Check("user:alice", "doc:42")
+	if err != nil {
+		return nil, err
+	}
+	add(RevisionAware, "Revision-aware: a re-grant is visible immediately",
+		"Stale DENYs are refused too: the cached DENY predates the re-grant's token, so Alice gets ALLOW.",
+		regrant.Correct && regrant.Decision == "ALLOW",
 		describe(regrant))
-
-	d2 := New(RevisionAware)
-	warm, _ := d2.Check("user:bob", "doc:7")
-	d2.Check("user:alice", "doc:42")
-	if _, err := d2.Revoke("user:alice", "doc:42"); err != nil {
-		panic(err)
-	}
-	other, _ := d2.Check("user:bob", "doc:7")
-	add("Revision-aware: unrelated documents keep their cache hits",
-		"Revoking Alice on doc:42 doesn't touch doc:7's token, so Bob's doc:7 check is still served from the cache.",
-		warm.ServedBy == "primary" && other.ServedBy == "cache" && other.Correct,
-		describe(other))
-
-	return cases
+	return cases, nil
 }
 
-// propertyRun replays one random workload against both modes. Writes and
-// checks are generated once, so both modes see exactly the same operations.
-func propertyRun(seed uint64, ops int, ps *PropertyStats) {
+// propertyRun replays one random workload against all strategies. Writes,
+// checks and clock advances are generated once, so every strategy sees
+// exactly the same operations at the same simulated times.
+func propertyRun(seed uint64, ops int, ps *PropertyStats) error {
 	rng := rand.New(rand.NewPCG(seed, 0xa11ce))
-	plain, aware := New(PlainCache), New(RevisionAware)
+	demos := make([]*Demo, len(Strategies))
+	for i, s := range Strategies {
+		d, err := New(s)
+		if err != nil {
+			return err
+		}
+		defer d.Close()
+		demos[i] = d
+	}
 	viewers := map[string]bool{"user:alice|doc:42": true}
 
 	for range ops {
+		// Requests arrive 0-40 ms apart, so some land inside the 80 ms
+		// invalidation window and some after it.
+		gap := rng.Int64N(41)
+		for _, d := range demos {
+			d.Advance(gap)
+		}
 		u := Users[rng.IntN(len(Users))]
 		doc := Docs[rng.IntN(len(Docs))]
 		key := u + "|" + doc
-		switch r := rng.Float64(); {
+		r := rng.Float64()
+		switch {
 		case r < 0.05 && !viewers[key]:
 			viewers[key] = true
-			plain.Grant(u, doc)
-			aware.Grant(u, doc)
+			for _, d := range demos {
+				if _, err := d.Grant(u, doc); err != nil {
+					return err
+				}
+			}
 			ps.Writes++
 		case r < 0.10 && viewers[key]:
 			delete(viewers, key)
-			plain.Revoke(u, doc)
-			aware.Revoke(u, doc)
+			for _, d := range demos {
+				if _, err := d.Revoke(u, doc); err != nil {
+					return err
+				}
+			}
 			ps.Writes++
 		default:
-			for _, m := range []struct {
-				d *Demo
-				s *ModeStats
-			}{{plain, &ps.Plain}, {aware, &ps.Aware}} {
-				res, err := m.d.Check(u, doc)
+			for _, d := range demos {
+				res, err := d.Check(u, doc)
 				if err != nil {
-					panic(err)
+					return err
 				}
-				m.s.Checks++
-				m.s.MeanMs += res.LatencyMs
+				s := ps.ByStrat[d.Strategy]
+				s.Checks++
+				s.MeanMs += res.LatencyMs
 				if !res.Correct {
-					m.s.Wrong++
+					s.Wrong++
+					if res.RaceWindow {
+						s.InWindow++
+					}
 				}
 				if res.Decision == "ALLOW" && res.Expected == "DENY" {
-					m.s.StaleAllows++
+					s.StaleAllows++
 				}
 				if res.ServedBy == "cache" {
-					m.s.CacheHits++
+					s.CacheHits++
 				}
 				if res.ServedBy == "primary" && res.CacheRev > 0 {
-					m.s.Fallbacks++
+					s.Fallbacks++
 				}
 			}
 		}
 	}
+	return nil
 }
 
-func propertyCases() ([]TestCase, PropertyStats) {
-	ps := PropertyStats{Seeds: 50, OpsPerRun: 400}
-	for seed := uint64(1); seed <= uint64(ps.Seeds); seed++ {
-		propertyRun(seed, ps.OpsPerRun, &ps)
+func propertyCases() ([]TestCase, PropertyStats, error) {
+	ps := PropertyStats{Seeds: 30, OpsPerRun: 400, ByStrat: map[Strategy]*StrategyStats{}}
+	for _, s := range Strategies {
+		ps.ByStrat[s] = &StrategyStats{}
 	}
-	for _, s := range []*ModeStats{&ps.Plain, &ps.Aware} {
+	for seed := uint64(1); seed <= uint64(ps.Seeds); seed++ {
+		if err := propertyRun(seed, ps.OpsPerRun, &ps); err != nil {
+			return nil, ps, err
+		}
+	}
+	for _, s := range ps.ByStrat {
 		if s.Checks > 0 {
 			s.MeanMs /= float64(s.Checks)
 			s.HitRatePct = 100 * float64(s.CacheHits) / float64(s.Checks)
 		}
 	}
-	summary := func(name string, s ModeStats) string {
-		return fmt.Sprintf("%s: %d checks, %d wrong (%d stale ALLOWs), cache hit rate %.1f%%, %d fallbacks, mean latency %.2f ms",
-			name, s.Checks, s.Wrong, s.StaleAllows, s.HitRatePct, s.Fallbacks, s.MeanMs)
+	summary := func(s Strategy) string {
+		st := ps.ByStrat[s]
+		return fmt.Sprintf("%s: %d checks, %d wrong (%d stale ALLOWs, %d inside an invalidation window), cache hit rate %.1f%%, %d fallbacks, mean latency %.2f ms",
+			s, st.Checks, st.Wrong, st.StaleAllows, st.InWindow, st.HitRatePct, st.Fallbacks, st.MeanMs)
 	}
+	ttl, inv, ra := ps.ByStrat[TTL], ps.ByStrat[Invalidation], ps.ByStrat[RevisionAware]
+	workload := fmt.Sprintf("%d random workloads × %d operations (grants, revokes and checks for %d users on %d documents, 0-40 ms apart)", ps.Seeds, ps.OpsPerRun, len(Users), len(Docs))
 	cases := []TestCase{
 		{
-			Name:        "Property: revision-aware decisions always match the primary",
-			Kind:        "property",
-			Description: fmt.Sprintf("%d random workloads × %d operations (grants, revokes, checks for %d users on %d documents). Every revision-aware decision must equal the primary's.", ps.Seeds, ps.OpsPerRun, len(Users), len(Docs)),
-			Passed:      ps.Aware.Wrong == 0 && ps.Aware.Checks > 0,
-			Details:     []string{summary("revision-aware", ps.Aware)},
+			Name: "Property: revision-aware decisions always match SQLite", Kind: "property", Strategy: RevisionAware,
+			Description: workload + ". Every revision-aware decision must equal SQLite's at the moment of the check.",
+			Passed:      ra.Checks > 0 && ra.Wrong == 0,
+			Details:     []string{summary(RevisionAware)},
 		},
 		{
-			Name:        "Property sanity: the same workloads catch the plain cache",
-			Kind:        "property",
-			Description: "A test that can't fail proves nothing. The identical workloads must detect stale decisions in the plain cache.",
-			Passed:      ps.Plain.StaleAllows > 0,
-			Details:     []string{summary("plain cache", ps.Plain)},
+			Name: "Property: invalidation mitigates, but cannot eliminate, stale decisions", Kind: "property", Strategy: Invalidation,
+			Description: "On the same workloads, invalidation must make far fewer mistakes than TTL, yet still some, and every one of them must fall inside an invalidation's propagation window.",
+			Passed:      inv.Wrong > 0 && inv.Wrong < ttl.Wrong && inv.InWindow == inv.Wrong,
+			Details:     []string{summary(Invalidation)},
+		},
+		{
+			Name: "Property sanity: the same workloads catch the TTL cache", Kind: "property", Strategy: TTL,
+			Description: "A test that can't fail proves nothing. The identical workloads must detect stale decisions in the TTL cache.",
+			Passed:      ttl.StaleAllows > 0,
+			Details:     []string{summary(TTL)},
 		},
 	}
-	return cases, ps
+	return cases, ps, nil
 }
 
 // RunSuite runs every correctness test.
-func RunSuite() SuiteResult {
+func RunSuite() (SuiteResult, error) {
 	start := time.Now()
-	res := SuiteResult{Cases: scenarioCases()}
-	pc, ps := propertyCases()
-	res.Cases = append(res.Cases, pc...)
-	res.Property = ps
-	res.Passed = true
+	sc, err := scenarioCases()
+	if err != nil {
+		return SuiteResult{}, err
+	}
+	pc, ps, err := propertyCases()
+	if err != nil {
+		return SuiteResult{}, err
+	}
+	res := SuiteResult{Cases: append(sc, pc...), Property: ps, Passed: true}
 	for _, c := range res.Cases {
 		res.Passed = res.Passed && c.Passed
 	}
 	res.DurationMs = float64(time.Since(start).Microseconds()) / 1000
-	return res
+	return res, nil
 }
