@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/poorkenny/authz-lab/internal/api"
+	"github.com/poorkenny/authz-lab/internal/features"
 	"github.com/poorkenny/authz-lab/web"
 )
 
@@ -19,8 +20,11 @@ func main() {
 		port = "8080"
 	}
 
+	flags := features.FromEnv(os.Getenv)
+	log.Printf("feature flags: %+v (see docs/FEATURES.md)", flags)
+
 	mux := http.NewServeMux()
-	api.NewServer().Routes(mux)
+	api.NewServer(flags).Routes(mux)
 	mux.Handle("/", spa(web.Dist()))
 
 	srv := &http.Server{

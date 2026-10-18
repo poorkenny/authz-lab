@@ -1,6 +1,8 @@
-// Package api exposes the strategy showcase over HTTP. Every request is scoped
-// to a reviewer session via the X-Lab-Session header (the UI generates one per
-// browser), so reviewers on a shared instance never see each other's state.
+// Package api exposes the strategy showcase over HTTP. Every request is
+// scoped to a reviewer session via the X-Lab-Session header (the UI generates
+// one per browser), so reviewers on a shared instance never see each other's
+// state. A session holds two worlds: the main demo (any strategy) and the
+// invalidation-queue simulation (always the invalidation strategy).
 package api
 
 import (
@@ -13,6 +15,7 @@ import (
 
 	"github.com/poorkenny/authz-lab/internal/audit"
 	"github.com/poorkenny/authz-lab/internal/demo"
+	"github.com/poorkenny/authz-lab/internal/features"
 )
 
 const (
@@ -29,6 +32,7 @@ var sessionRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 type session struct {
 	mu       sync.Mutex
 	demo     *demo.Demo
+	sim      *demo.Demo
 	lastUsed time.Time
 	tokens   float64
 	tokensAt time.Time
@@ -48,10 +52,11 @@ func (s *session) allow() bool {
 type Server struct {
 	mu       sync.Mutex
 	sessions map[string]*session
+	flags    features.Flags
 }
 
-func NewServer() *Server {
-	s := &Server{sessions: map[string]*session{}}
+func NewServer(flags features.Flags) *Server {
+	s := &Server{sessions: map[string]*session{}, flags: flags}
 	go func() {
 		for range time.Tick(time.Minute) {
 			s.mu.Lock()
@@ -83,16 +88,21 @@ func (s *Server) session(id string) (*session, error) {
 		}
 		s.drop(oldestID)
 	}
-	d, err := demo.New(demo.TTL)
+	d, err := s.newDemo(demo.TTL)
 	if err != nil {
 		return nil, err
 	}
-	ss := &session{demo: d, lastUsed: time.Now(), tokens: rateBurst, tokensAt: time.Now()}
+	sim, err := demo.New(demo.Invalidation)
+	if err != nil {
+		d.Close()
+		return nil, err
+	}
+	ss := &session{demo: d, sim: sim, lastUsed: time.Now(), tokens: rateBurst, tokensAt: time.Now()}
 	s.sessions[id] = ss
 	return ss, nil
 }
 
-// drop removes a session and closes its SQLite database. Callers hold s.mu.
+// drop removes a session and closes its SQLite databases. Callers hold s.mu.
 func (s *Server) drop(id string) {
 	ss := s.sessions[id]
 	delete(s.sessions, id)
@@ -100,8 +110,35 @@ func (s *Server) drop(id string) {
 		ss.mu.Lock()
 		defer ss.mu.Unlock()
 		ss.demo.Close()
+		ss.sim.Close()
 	}()
 }
+
+// newDemo creates a main-demo world configured by the feature flags.
+func (s *Server) newDemo(st demo.Strategy) (*demo.Demo, error) {
+	d, err := demo.New(st)
+	if err != nil {
+		return nil, err
+	}
+	d.AutoDeliver = !s.flags.ControlledCacheDelivery
+	return d, nil
+}
+
+// requireControlledDelivery rejects requests for the controlled-cache-delivery
+// feature when its flag is off.
+func (s *Server) requireControlledDelivery() error {
+	if !s.flags.ControlledCacheDelivery {
+		return httpError{http.StatusNotFound, "controlled cache delivery is disabled (FEATURE_CONTROLLED_CACHE_DELIVERY=false)"}
+	}
+	return nil
+}
+
+type world int
+
+const (
+	mainWorld world = iota
+	simWorld
+)
 
 func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -110,13 +147,39 @@ func (s *Server) Routes(mux *http.ServeMux) {
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "sessions": n})
 	})
-	mux.HandleFunc("GET /api/v1/state", s.with(func(r *http.Request, d **demo.Demo) (any, error) {
-		return (*d).State()
-	}))
-	mux.HandleFunc("POST /api/v1/reset", s.with(func(r *http.Request, d **demo.Demo) (any, error) {
-		return reset(d, (*d).Strategy)
-	}))
-	mux.HandleFunc("POST /api/v1/strategy", s.with(func(r *http.Request, d **demo.Demo) (any, error) {
+	mux.HandleFunc("GET /api/v1/features", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, s.flags)
+	})
+
+	// Routes shared by both worlds: /api/v1/... (main) and /api/v1/sim/... (queue simulation).
+	for prefix, wd := range map[string]world{"/api/v1": mainWorld, "/api/v1/sim": simWorld} {
+		mux.HandleFunc("GET "+prefix+"/state", s.with(wd, func(r *http.Request, d **demo.Demo) (any, error) {
+			return (*d).State()
+		}))
+		mux.HandleFunc("POST "+prefix+"/reset", s.with(wd, func(r *http.Request, d **demo.Demo) (any, error) {
+			if wd == simWorld {
+				return s.reset(d, demo.Invalidation, false)
+			}
+			return s.reset(d, (*d).Strategy, true)
+		}))
+		mux.HandleFunc("POST "+prefix+"/grant", s.with(wd, func(r *http.Request, d **demo.Demo) (any, error) {
+			return withPair(r, (*d).Grant)
+		}))
+		mux.HandleFunc("POST "+prefix+"/revoke", s.with(wd, func(r *http.Request, d **demo.Demo) (any, error) {
+			return withPair(r, (*d).Revoke)
+		}))
+		mux.HandleFunc("POST "+prefix+"/check", s.with(wd, func(r *http.Request, d **demo.Demo) (any, error) {
+			return withPair(r, (*d).Check)
+		}))
+		mux.HandleFunc("POST "+prefix+"/deliver", s.with(wd, func(r *http.Request, d **demo.Demo) (any, error) {
+			if err := s.requireControlledDelivery(); err != nil {
+				return nil, err
+			}
+			return (*d).DeliverNext(), nil
+		}))
+	}
+
+	mux.HandleFunc("POST /api/v1/strategy", s.with(mainWorld, func(r *http.Request, d **demo.Demo) (any, error) {
 		var req struct {
 			Strategy string `json:"strategy"`
 		}
@@ -128,37 +191,43 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			return nil, badRequest(err)
 		}
 		// A strategy change starts a fresh world so runs are comparable.
-		return reset(d, st)
+		return s.reset(d, st, true)
 	}))
-	mux.HandleFunc("POST /api/v1/grant", s.with(func(r *http.Request, d **demo.Demo) (any, error) {
-		return withPair(r, *d, (*d).Grant)
+	mux.HandleFunc("POST /api/v1/sim/other-writes", s.with(simWorld, func(r *http.Request, d **demo.Demo) (any, error) {
+		var req struct {
+			Count int `json:"count"`
+		}
+		if err := decode(r, &req); err != nil {
+			return nil, err
+		}
+		if req.Count < 1 || req.Count > 10 {
+			return nil, badRequest(errors.New("count must be between 1 and 10"))
+		}
+		if (*d).Queue.Depth()+req.Count > 30 {
+			return nil, badRequest(errors.New("the simulation queue holds at most 30 events; deliver some first"))
+		}
+		return (*d).AddOtherWrites(req.Count)
 	}))
-	mux.HandleFunc("POST /api/v1/revoke", s.with(func(r *http.Request, d **demo.Demo) (any, error) {
-		return withPair(r, *d, (*d).Revoke)
-	}))
-	mux.HandleFunc("POST /api/v1/check", s.with(func(r *http.Request, d **demo.Demo) (any, error) {
-		return withPair(r, *d, (*d).Check)
-	}))
-	mux.HandleFunc("GET /api/v1/audit", s.with(func(r *http.Request, d **demo.Demo) (any, error) {
-		return map[string]any{"records": (*d).Audit.Query(audit.Filter{Limit: 200, StaleOnly: r.URL.Query().Get("stale") == "true"})}, nil
-	}))
-	mux.HandleFunc("GET /api/v1/compare", s.with(func(r *http.Request, _ **demo.Demo) (any, error) {
+	mux.HandleFunc("GET /api/v1/compare", s.with(mainWorld, func(r *http.Request, _ **demo.Demo) (any, error) {
 		type row struct {
 			Strategy demo.Strategy    `json:"strategy"`
-			Soon     demo.CheckResult `json:"soon"`
-			Later    demo.CheckResult `json:"later"`
+			Before   demo.CheckResult `json:"before"`
+			After    demo.CheckResult `json:"after"`
 		}
 		var rows []row
 		for _, st := range demo.Strategies {
-			soon, later, err := demo.Story(st)
+			before, after, err := demo.Story(st, !s.flags.ControlledCacheDelivery)
 			if err != nil {
 				return nil, err
 			}
-			rows = append(rows, row{st, soon, later})
+			rows = append(rows, row{st, before, after})
 		}
 		return map[string]any{"rows": rows}, nil
 	}))
-	mux.HandleFunc("POST /api/v1/tests/run", s.with(func(r *http.Request, _ **demo.Demo) (any, error) {
+	mux.HandleFunc("GET /api/v1/audit", s.with(mainWorld, func(r *http.Request, d **demo.Demo) (any, error) {
+		return map[string]any{"records": (*d).Audit.Query(audit.Filter{Limit: 200, StaleOnly: r.URL.Query().Get("stale") == "true"})}, nil
+	}))
+	mux.HandleFunc("POST /api/v1/tests/run", s.with(mainWorld, func(r *http.Request, _ **demo.Demo) (any, error) {
 		return demo.RunSuite()
 	}))
 }
@@ -172,8 +241,8 @@ func (e httpError) Error() string { return e.msg }
 
 func badRequest(err error) error { return httpError{http.StatusBadRequest, err.Error()} }
 
-// with resolves the session, rate-limits it and serializes access to its demo.
-func (s *Server) with(h func(r *http.Request, d **demo.Demo) (any, error)) http.HandlerFunc {
+// with resolves the session, rate-limits it and serializes access to the chosen world.
+func (s *Server) with(wd world, h func(r *http.Request, d **demo.Demo) (any, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get(sessionHdr)
 		if id == "" {
@@ -195,7 +264,15 @@ func (s *Server) with(h func(r *http.Request, d **demo.Demo) (any, error)) http.
 			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limit exceeded, slow down"})
 			return
 		}
-		out, err := h(r, &ss.demo)
+		target := &ss.demo
+		if wd == simWorld {
+			if err := s.requireControlledDelivery(); err != nil {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+				return
+			}
+			target = &ss.sim
+		}
+		out, err := h(r, target)
 		if err != nil {
 			status := http.StatusInternalServerError
 			var he httpError
@@ -209,8 +286,15 @@ func (s *Server) with(h func(r *http.Request, d **demo.Demo) (any, error)) http.
 	}
 }
 
-func reset(d **demo.Demo, st demo.Strategy) (any, error) {
-	fresh, err := demo.New(st)
+// reset replaces a world with a fresh one; main-demo worlds follow the feature flags.
+func (s *Server) reset(d **demo.Demo, st demo.Strategy, main bool) (any, error) {
+	var fresh *demo.Demo
+	var err error
+	if main {
+		fresh, err = s.newDemo(st)
+	} else {
+		fresh, err = demo.New(st)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -219,21 +303,14 @@ func reset(d **demo.Demo, st demo.Strategy) (any, error) {
 	return fresh.State()
 }
 
-// withPair decodes {subject, object, waitMs}, advances the simulated clock by
-// waitMs, then runs f.
-func withPair[T any](r *http.Request, d *demo.Demo, f func(subject, object string) (T, error)) (any, error) {
+func withPair[T any](r *http.Request, f func(subject, object string) (T, error)) (any, error) {
 	var req struct {
 		Subject string `json:"subject"`
 		Object  string `json:"object"`
-		WaitMs  int64  `json:"waitMs"`
 	}
 	if err := decode(r, &req); err != nil {
 		return nil, err
 	}
-	if req.WaitMs < 0 || req.WaitMs > 3_600_000 {
-		return nil, badRequest(errors.New("waitMs must be between 0 and 3600000"))
-	}
-	d.Advance(req.WaitMs)
 	out, err := f(req.Subject, req.Object)
 	if err != nil {
 		return nil, badRequest(err)

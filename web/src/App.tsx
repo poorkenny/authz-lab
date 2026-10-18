@@ -1,37 +1,43 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "./api";
-import type { CheckResult, CompareRow, Hop, State, Strategy, WriteResult } from "./types";
+import type { CheckResult, CompareRow, DeliverResult, Features, Hop, State, Strategy, WriteResult } from "./types";
 import { FlowDiagram, fmtMs, hopMs, shortLabel } from "./components/FlowDiagram";
-import { RaceTimeline } from "./components/RaceTimeline";
+import { QueueSimulation } from "./components/QueueSimulation";
 import { TestsPanel } from "./components/TestsPanel";
 import { STRATEGIES, byId } from "./strategies";
 
-type Entry = { kind: "check"; r: CheckResult } | { kind: "write"; r: WriteResult };
+type Entry = { kind: "check"; r: CheckResult } | { kind: "write"; r: WriteResult } | { kind: "deliver"; r: DeliverResult };
 
-interface StepDef {
-  title: string;
-  hint: string;
-  run: (a: Actions) => Promise<void>;
-}
 interface Actions {
-  check: (subject: string, object: string, waitMs?: number) => Promise<void>;
-  write: (op: "grant" | "revoke", subject: string, object: string, waitMs?: number) => Promise<void>;
+  check: (subject: string, object: string) => Promise<void>;
+  write: (op: "grant" | "revoke", subject: string, object: string) => Promise<void>;
+  deliver: () => Promise<void>;
 }
 
-const STEPS: StepDef[] = [
+type StepDef = { title: string; hint: string; run: (a: Actions) => Promise<void> };
+
+// With controlled cache delivery the story pauses so the reviewer delivers the
+// invalidation event; without it, events are delivered right after the commit.
+const CONTROLLED_STEPS: StepDef[] = [
   { title: "Alice opens doc:42", hint: "Cache miss → SQLite → ALLOW is cached.", run: (a) => a.check("user:alice", "doc:42") },
-  { title: "1 s later, admin revokes Alice", hint: "SQLite commits the revoke.", run: (a) => a.write("revoke", "user:alice", "doc:42", 1000) },
-  { title: "Alice retries 10 ms later", hint: "Inside the invalidation's 80 ms propagation window.", run: (a) => a.check("user:alice", "doc:42", 10) },
-  { title: "Alice retries 1 s later", hint: "After the invalidation has arrived.", run: (a) => a.check("user:alice", "doc:42", 1000) },
+  { title: "Admin revokes Alice", hint: "SQLite commits the revoke. Invalidation strategy: an event is queued.", run: (a) => a.write("revoke", "user:alice", "doc:42") },
+  { title: "Alice reads before delivery", hint: "The invalidation event is still in the queue.", run: (a) => a.check("user:alice", "doc:42") },
+  { title: "Deliver the invalidation event", hint: "Manual: delivers the head of the queue to the cache.", run: (a) => a.deliver() },
+  { title: "Alice reads after delivery", hint: "Is the cache fresh now?", run: (a) => a.check("user:alice", "doc:42") },
+];
+const AUTO_STEPS: StepDef[] = [
+  { title: "Alice opens doc:42", hint: "Cache miss → SQLite → ALLOW is cached.", run: (a) => a.check("user:alice", "doc:42") },
+  { title: "Admin revokes Alice", hint: "SQLite commits the revoke. Invalidation strategy: the event is delivered right away.", run: (a) => a.write("revoke", "user:alice", "doc:42") },
+  { title: "Alice reads again", hint: "Is the cache fresh?", run: (a) => a.check("user:alice", "doc:42") },
 ];
 
 // Latency of each path through the system (sum of the modelled hops).
 const PATHS = [
   { id: "hit", name: "Cache hit (TTL / invalidation)", hops: "request 0.5 + lookup 0.2 + response 0.5", ms: "1.2 ms" },
   { id: "ra-hit", name: "Revision-aware hit (entry fresh)", hops: "+ revision check 0.01", ms: "1.21 ms" },
-  { id: "miss", name: "Cache miss → SQLite (incl. after an invalidation)", hops: "+ SQLite query 15 + cache refresh 0.1", ms: "16.3 ms" },
+  { id: "miss", name: "Cache miss → SQLite (incl. after a delivery)", hops: "+ SQLite query 15 + cache refresh 0.1", ms: "16.3 ms" },
   { id: "ra-fallback", name: "Revision-aware fallback (entry stale)", hops: "+ revision check + SQLite 15 + refresh", ms: "16.31 ms" },
-  { id: "write", name: "Write: SQLite commit", hops: "invalidation travels async (+80 ms), off the write path", ms: "15 ms" },
+  { id: "write", name: "Write: SQLite commit (+ enqueue)", hops: "commit 15 + enqueue 0.3; delivery is a separate, later event", ms: "15.3 ms" },
 ];
 
 function pathOf(r: CheckResult): string {
@@ -41,6 +47,7 @@ function pathOf(r: CheckResult): string {
 
 export default function App() {
   const [state, setState] = useState<State | null>(null);
+  const [flags, setFlags] = useState<Features>({ controlledCacheDelivery: true });
   const [step, setStep] = useState(0);
   const [log, setLog] = useState<Entry[]>([]);
   const [hops, setHops] = useState<Hop[]>([]);
@@ -53,6 +60,10 @@ export default function App() {
   const demoRef = useRef<HTMLElement>(null);
 
   useEffect(() => {
+    api
+      .features()
+      .then(setFlags)
+      .catch(() => {});
     api.state().then(setState).catch((e: Error) => setError(e.message));
     api
       .compare()
@@ -73,21 +84,31 @@ export default function App() {
     }
   }
 
+  const push = (e: Entry) => setLog((l) => [e, ...l].slice(0, 12));
   const actions: Actions = {
-    check: (subject, object, waitMs = 0) =>
+    check: (subject, object) =>
       act(async () => {
-        const r = await api.check({ subject, object, waitMs });
-        setLog((l) => [{ kind: "check" as const, r }, ...l].slice(0, 12));
+        const r = await api.check(subject, object);
+        push({ kind: "check", r });
         setHops(r.hops);
         setActor(`Client (${subject.replace("user:", "")})`);
       }),
-    write: (op, subject, object, waitMs = 0) =>
+    write: (op, subject, object) =>
       act(async () => {
-        const r = await api[op]({ subject, object, waitMs });
-        setLog((l) => [{ kind: "write" as const, r }, ...l].slice(0, 12));
+        const r = await api[op](subject, object);
+        push({ kind: "write", r });
+        setHops(r.hops);
+      }),
+    deliver: () =>
+      act(async () => {
+        const r = await api.deliver();
+        push({ kind: "deliver", r });
         setHops(r.hops);
       }),
   };
+
+  const controlled = flags.controlledCacheDelivery;
+  const STEPS = controlled ? CONTROLLED_STEPS : AUTO_STEPS;
 
   async function runStep(i: number) {
     await STEPS[i].run(actions);
@@ -186,18 +207,18 @@ export default function App() {
         </ol>
         {error && <p className="txt-bad">{error}</p>}
 
-        <FlowDiagram hops={hops} state={state} actor={actor} />
+        <FlowDiagram hops={hops} state={state} actor={actor} onDeliver={controlled ? actions.deliver : undefined} busy={busy} />
 
         {lastEntry && (
           <div className="result-row">
             {lastEntry.kind === "check" ? (
               <div className={`result ${lastEntry.r.correct ? "ok" : "bad"}`} aria-live="polite">
                 <div className="decision">
-                  t={lastEntry.r.t} ms · {lastEntry.r.subject.replace("user:", "")} → {lastEntry.r.object}: <strong>{lastEntry.r.decision}</strong>
+                  {lastEntry.r.subject.replace("user:", "")} → {lastEntry.r.object}: <strong>{lastEntry.r.decision}</strong>
                   <span className={`badge ${lastEntry.r.correct ? "ok" : "bad"}`}>
                     {lastEntry.r.correct ? "✓ fresh" : `✕ stale: SQLite says ${lastEntry.r.expected}`}
                   </span>
-                  {lastEntry.r.raceWindow && <span className="badge warn">invalidation in flight</span>}
+                  {lastEntry.r.pending && <span className="badge warn">invalidation #{lastEntry.r.pending.id} still queued</span>}
                 </div>
                 <p>{lastEntry.r.reason}</p>
                 <p className="mono small">
@@ -205,11 +226,16 @@ export default function App() {
                   rev {lastEntry.r.primaryRev} · {fmtMs(lastEntry.r.latencyMs)} ms
                 </p>
               </div>
-            ) : (
+            ) : lastEntry.kind === "write" ? (
               <div className="result neutral" aria-live="polite">
                 <div className="decision">
-                  t={lastEntry.r.t} ms · {lastEntry.r.op === "delete" ? "Revoked" : "Granted"} <span className="mono">{lastEntry.r.tuple}</span>
+                  {lastEntry.r.op === "delete" ? "Revoked" : "Granted"} <span className="mono">{lastEntry.r.tuple}</span>
                 </div>
+                <p>{lastEntry.r.note}</p>
+              </div>
+            ) : (
+              <div className="result neutral" aria-live="polite">
+                <div className="decision">{lastEntry.r.delivered ? `Delivered invalidation #${lastEntry.r.message?.id}` : "Nothing to deliver"}</div>
                 <p>{lastEntry.r.note}</p>
               </div>
             )}
@@ -243,7 +269,7 @@ export default function App() {
                   <tr className="total-row">
                     <td></td>
                     <td colSpan={2}>critical path</td>
-                    <td className="mono num">{fmtMs(hops.reduce((a, h) => a + (h.kind === "async" ? 0 : h.ms), 0))} ms</td>
+                    <td className="mono num">{fmtMs(hops.reduce((a, h) => a + h.ms, 0))} ms</td>
                   </tr>
                 </tbody>
               </table>
@@ -282,8 +308,8 @@ export default function App() {
               <thead>
                 <tr>
                   <th scope="col">strategy</th>
-                  <th scope="col">10 ms after revoke</th>
-                  <th scope="col">1 s after revoke</th>
+                  <th scope="col">{controlled ? "read before delivery" : "read after revoke"}</th>
+                  <th scope="col">{controlled ? "read after delivery" : "read again"}</th>
                   <th scope="col">verdict</th>
                 </tr>
               </thead>
@@ -291,12 +317,12 @@ export default function App() {
                 {rows.map((r) => (
                   <tr key={r.strategy} className={r.strategy === strategy ? "current" : ""}>
                     <th scope="row">{byId[r.strategy].name}</th>
-                    {[r.soon, r.later].map((c, i) => (
+                    {[r.before, r.after].map((c, i) => (
                       <td key={i} className={c.correct ? "txt-ok" : "txt-bad"}>
                         {c.correct ? "✓" : "✕"} {c.decision} <span className="muted mono small">({c.servedBy}, {fmtMs(c.latencyMs)} ms)</span>
                       </td>
                     ))}
-                    <td>{r.soon.correct && r.later.correct ? "always fresh" : r.later.correct ? "mitigated: stale inside the window" : "stale until TTL"}</td>
+                    <td>{r.before.correct && r.after.correct ? "always fresh" : r.after.correct ? "stale until the event is delivered" : "stale until TTL"}</td>
                   </tr>
                 ))}
               </tbody>
@@ -317,13 +343,7 @@ export default function App() {
               <option value="doc:7">doc:7</option>
             </select>
             <button disabled={busy} onClick={() => actions.check(user, doc)}>
-              Check now
-            </button>
-            <button disabled={busy} onClick={() => actions.check(user, doc, 10)}>
-              Check in 10 ms
-            </button>
-            <button disabled={busy} onClick={() => actions.check(user, doc, 1000)}>
-              Check in 1 s
+              Check view
             </button>
             <button disabled={busy} onClick={() => actions.write("grant", user, doc)}>
               Grant viewer
@@ -331,6 +351,11 @@ export default function App() {
             <button disabled={busy} onClick={() => actions.write("revoke", user, doc)}>
               Revoke viewer
             </button>
+            {controlled && (
+              <button disabled={busy} onClick={actions.deliver}>
+                Deliver next invalidation
+              </button>
+            )}
           </div>
           {state && (
             <p className="mono small">
@@ -341,16 +366,18 @@ export default function App() {
             <ul className="history">
               {log.map((e, i) => (
                 <li key={i} className="small">
-                  <span className="mono">t={e.r.t}</span>{" "}
                   {e.kind === "check" ? (
                     <>
                       <span className={e.r.correct ? "txt-ok" : "txt-bad"}>{e.r.correct ? "✓" : "✕"}</span> {e.r.subject} view {e.r.object} → {e.r.decision} via{" "}
                       {e.r.servedBy} ({fmtMs(e.r.latencyMs)} ms)
                     </>
-                  ) : (
+                  ) : e.kind === "write" ? (
                     <>
                       ✎ {e.r.op} {e.r.tuple} → rev {e.r.rev}
+                      {e.r.message && <> · queued invalidation #{e.r.message.id}</>}
                     </>
+                  ) : (
+                    <>▶ {e.r.note}</>
                   )}
                 </li>
               ))}
@@ -359,46 +386,11 @@ export default function App() {
         </details>
       </section>
 
-      <section className="card" aria-labelledby="why-h">
-        <h2 id="why-h">3 · Why invalidation can't promise freshness, and how revision-aware does</h2>
-        <RaceTimeline rows={rows} />
-        <div className="two-col">
-          <div>
-            <h3>Invalidation: mitigated, never guaranteed</h3>
-            <ul>
-              <li>
-                The SQLite commit and the cache update are <strong>two separate events</strong>. No transaction spans the database and the cache, so there is always a
-                gap between them.
-              </li>
-              <li>Network delay, queueing, retries and GC pauses stretch the gap. A lost message stretches it to the full TTL.</li>
-              <li>With several cache nodes, each has its own gap. Invalidating before the commit doesn't help either: a concurrent read can refill the old value.</li>
-              <li>
-                You can make the window smaller, but in a distributed system you can't make it zero. Any check that lands inside it gets the old answer.
-              </li>
-            </ul>
-          </div>
-          <div>
-            <h3>Revision-aware: freshness decided on the read path</h3>
-            <pre className="code">{`required = doc.revisionToken     // bumped in the same SQLite tx
-entry    = cache.get(user, doc)
+      {controlled && <QueueSimulation />}
 
-if entry and entry.rev >= required:
-    return entry.decision        // fast path: fresh enough
+      <TestsPanel section={controlled ? 4 : 3} />
 
-decision = sqlite.check(user, doc)   // fallback: source of truth
-cache.put(user, doc, decision, rev = sqlite.rev)
-return decision`}</pre>
-            <p className="small">
-              The request carries the revision it needs, so correctness no longer depends on <em>when</em> a message arrives. The cost is the same SQLite
-              round trip invalidation pays after a change, plus propagating tokens with requests.
-            </p>
-          </div>
-        </div>
-      </section>
-
-      <TestsPanel />
-
-      <footer className="muted small">Mock system with modelled latencies and simulated time, backed by an in-memory SQLite store per browser session.</footer>
+      <footer className="muted small">Mock system with modelled latencies, backed by an in-memory SQLite store per browser session. {controlled ? "Invalidation events are delivered only when you click." : "Invalidation events are delivered automatically after each commit."}</footer>
     </div>
   );
 }
