@@ -46,6 +46,7 @@ export function shortLabel(h: Hop, i: number, hops: Hop[]): string {
   if (k === "client>checkapi") return "request";
   if (k === "checkapi>client") return "response";
   if (k === "cache>checkapi") return "revision check";
+  if (h.kind === "fail" && h.to === "primary") return k === "admin>primary" ? "commit failed" : "SQLite unavailable";
   if (k === "checkapi>primary") return h.kind === "fallback" ? "fallback to SQLite" : h.kind === "strong" ? "fully consistent read" : "SQLite query";
   if (k === "checkapi>cache") return hops.slice(0, i).some((p) => p.from === "checkapi" && p.to === "cache") ? "cache refresh" : "cache lookup";
   if (k === "admin>primary") return "SQLite commit";
@@ -109,7 +110,7 @@ export function FlowDiagram({ hops: hopsProp, state, actor, onDeliver, busy }: P
             let cls = "edge";
             if (queueEdge && !usesQueue) cls = "edge none-edge";
             else if (queueEdge && (kinds.includes("async") || (key === edgeKey("queue", "cache") && queued.length > 0))) cls = "edge async";
-            else if (used) cls = `edge used ${kinds.includes("stale") ? "k-stale" : kinds.includes("fallback") ? "k-fallback" : ""}`;
+            else if (used) cls = `edge used ${kinds.includes("stale") || kinds.includes("fail") ? "k-stale" : kinds.includes("fallback") ? "k-fallback" : ""}`;
             const active = current && edgeKey(current.from, current.to) === key;
             return <line key={key} x1={ca.x} y1={ca.y} x2={cb.x} y2={cb.y} className={`${cls} ${active ? "active" : ""}`} />;
           })}
@@ -117,8 +118,9 @@ export function FlowDiagram({ hops: hopsProp, state, actor, onDeliver, busy }: P
           {Object.entries(BOXES).map(([id, b]) => {
             const involved = visible.some((h) => h.from === id || h.to === id);
             const off = id === "queue" && !usesQueue;
+            const down = id === "primary" && state?.primaryDown;
             return (
-              <g key={id} className={`box ${involved ? "involved" : ""} ${off ? "off" : ""}`}>
+              <g key={id} className={`box ${involved ? "involved" : ""} ${off ? "off" : ""} ${down ? "down" : ""}`}>
                 <rect x={b.x} y={b.y} width={b.w} height={b.h} rx="10" />
                 <text x={b.x + 12} y={b.y + 22} className="box-title">
                   {id === "client" ? actor : b.label}
@@ -130,8 +132,8 @@ export function FlowDiagram({ hops: hopsProp, state, actor, onDeliver, busy }: P
                 )}
                 {id === "primary" && state && (
                   <>
-                    <text x={b.x + 12} y={b.y + 44} className="box-sub">
-                      source of truth · rev {state.primaryRev}
+                    <text x={b.x + 12} y={b.y + 44} className={`box-sub ${down ? "down-sub" : ""}`}>
+                      {down ? "✕ UNAVAILABLE" : "source of truth"} · rev {state.primaryRev}
                     </text>
                     <text x={b.x + 12} y={b.y + 64} className="box-sub">
                       doc:42 version token: ver#{state.docRev["doc:42"] ?? 0}

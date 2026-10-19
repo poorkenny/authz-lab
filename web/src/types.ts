@@ -8,6 +8,7 @@ export interface Features {
   strategyStories: boolean;
   happyPathComparison: boolean;
   clientVersionToken: boolean;
+  sqliteFailure: boolean;
 }
 
 export interface Hop {
@@ -15,7 +16,7 @@ export interface Hop {
   to: string;
   label: string;
   ms: number;
-  kind?: "ok" | "stale" | "fallback" | "async" | "none" | "strong";
+  kind?: "ok" | "stale" | "fallback" | "async" | "none" | "strong" | "fail";
 }
 
 export interface QueueMsg {
@@ -54,6 +55,28 @@ export interface CheckResult {
   latestToken?: number;
   evaluatedRev: number;
   contractMet: boolean;
+  // SQLite was down; answered from a cached snapshot that satisfies the request.
+  primaryDown: boolean;
+}
+
+// The body of a 503: SQLite is down and no cached snapshot satisfies the request.
+export interface Unavailable {
+  message: string;
+  subject: string;
+  object: string;
+  requiredRev: number;
+  snapshotRev: number;
+  latestToken?: number;
+  tokenSource?: "latest" | "client";
+  consistency?: "at_least_as_fresh" | "fully_consistent";
+  latencyMs: number;
+  hops: Hop[];
+}
+
+export interface PrimaryResult {
+  down: boolean;
+  note: string;
+  hops: Hop[];
 }
 
 // Revision-aware request options (FEATURE_CLIENT_VERSION_TOKEN).
@@ -119,6 +142,7 @@ export interface State {
   ttlSec: number;
   enforceTTL: boolean;
   clockSec: number;
+  primaryDown: boolean;
 }
 
 export interface CompareRow {

@@ -18,6 +18,7 @@ Every feature of the demo ships behind a **feature flag**, so it can be released
 | [`FEATURE_STRATEGY_STORIES`](#feature_strategy_stories) | `true` (enabled) | Released | PR #7 |
 | [`FEATURE_HAPPY_PATH_COMPARISON`](#feature_happy_path_comparison) | `true` (enabled) | Released | PR #7 |
 | [`FEATURE_CLIENT_VERSION_TOKEN`](#feature_client_version_token) | `true` (enabled) | Released | PR #9 |
+| [`FEATURE_SQLITE_FAILURE`](#feature_sqlite_failure) | `true` (enabled) | Released | PR #10 |
 | `FEATURE_AUTH` | `false` | Planned: authentication and user management (see [TODO.md](../TODO.md)) | not implemented |
 
 ## How to enable / disable a flag
@@ -142,3 +143,31 @@ A token newer than the latest committed revision is rejected with `400`, and so 
 | Date | Change |
 |---|---|
 | 2026-10-18 | Introduced, enabled by default (PR #9) |
+
+## `FEATURE_SQLITE_FAILURE`
+
+**SQLite failure simulation**: a separate world (revision-aware strategy, client version tokens always on) where SQLite can be taken down, to show failure handling on a failed read from the primary store. While SQLite is down:
+
+- A check is answered from a **cached snapshot whose revision is equal to or newer than the revision the request asks for** (its version token). The response is a normal `200` with `primaryDown: true`.
+- Otherwise the API returns **`503 Service Unavailable`** with `"error": "SQLite is unavailable and no snapshot satisfies the revision: …"`. That covers a snapshot older than the requested version, no cached snapshot at all, and a fully consistent check (which always needs SQLite). It never answers from an older snapshot.
+- Writes return `503`: nothing is committed.
+
+The Check API gives up on the unavailable SQLite after a modelled 50 ms timeout, so a 503 costs about 51 ms. The correct-answer oracle still reads SQLite, off the request path.
+
+- **Default:** `true` (enabled)
+- **Code:** `internal/features` (flag), `internal/demo` (`Demo.PrimaryDown`, `SetPrimaryDown`, `UnavailableError`), `internal/api` (`/api/v1/outage/*` routes, 503 mapping), `web/src/components/OutageSimulation.tsx` (UI section)
+
+| | Enabled (`true`) | Disabled (`false`) |
+|---|---|---|
+| `/api/v1/outage/{state,reset,check,grant,revoke}` and `POST /api/v1/outage/primary {down}` | Available. `check` takes `token` and `consistency`; a check that no snapshot satisfies returns `503` with an `unavailable` object (`requiredRev`, `snapshotRev`, `latestToken`, `hops`, `latencyMs`) | `404` |
+| UI section "Simulation: SQLite failure" | Shown: failure handling rule, SQLite up/down switch, 7-step story, own-request selector, responses table (200 / 503) | Hidden |
+| Main demo and queue simulation | Unaffected: SQLite never fails there | Unaffected |
+| `GET /api/v1/features` | `"sqliteFailure":true` | `"sqliteFailure":false` |
+
+The story: Alice opens doc:42 (snapshot at rev 3, her client keeps ver#3) → admin grants Carol (doc:42 → ver#4) → **SQLite fails** → Alice checks with ver#3 (**200** from the snapshot, rev 3 ≥ ver#3) → Alice checks with the latest token (**503**: snapshot rev 3 < ver#4; also try Carol with nothing cached, a fully consistent check, a write) → SQLite recovers → Alice checks with the latest token again (200 from SQLite, snapshot refreshed). The correctness suite covers all three stages whatever the flag says.
+
+### Release history
+
+| Date | Change |
+|---|---|
+| 2026-10-18 | Introduced, enabled by default (PR #10) |

@@ -19,6 +19,7 @@ func TestFromEnv(t *testing.T) {
 		"FEATURE_STRATEGY_STORIES":          func(f Flags) bool { return f.StrategyStories },
 		"FEATURE_HAPPY_PATH_COMPARISON":     func(f Flags) bool { return f.HappyPathComparison },
 		"FEATURE_CLIENT_VERSION_TOKEN":      func(f Flags) bool { return f.ClientVersionToken },
+		"FEATURE_SQLITE_FAILURE":            func(f Flags) bool { return f.SQLiteFailure },
 	}
 	for name, get := range flags {
 		for _, c := range cases {

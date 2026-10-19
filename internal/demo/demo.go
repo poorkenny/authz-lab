@@ -16,6 +16,10 @@
 //     computed at, and every check carries the document's revision token (the
 //     revision of its last ACL change, like a Zanzibar zookie). An entry older
 //     than the token is never served; the check falls back to the primary.
+//
+// PrimaryDown simulates a SQLite outage: a check can still be answered from
+// a cached snapshot that satisfies the request, otherwise it fails with an
+// *UnavailableError (HTTP 503).
 package demo
 
 import (
@@ -56,7 +60,10 @@ const (
 	CacheFillMs  = 0.1  // write the fresh decision back into the cache
 	CommitMs     = 15.0 // admin → SQLite primary: transaction commit
 	EnqueueMs    = 0.3  // publish an invalidation event onto the queue
-	CacheTTLSec  = 300
+	// PrimaryTimeoutMs is how long the Check API waits for an unavailable
+	// SQLite before giving up.
+	PrimaryTimeoutMs = 50.0
+	CacheTTLSec      = 300
 )
 
 // Hop is one step of a request through the system, with its latency.
@@ -65,7 +72,7 @@ type Hop struct {
 	To    string  `json:"to"`
 	Label string  `json:"label"`
 	Ms    float64 `json:"ms"`
-	// Kind is "ok", "stale", "fallback", "async", "none", "strong" or "" for neutral.
+	// Kind is "ok", "stale", "fallback", "async", "none", "strong", "fail" or "" for neutral.
 	Kind string `json:"kind,omitempty"`
 }
 
@@ -109,6 +116,9 @@ type Demo struct {
 	// Now is the wall clock (replaceable in tests); the simulated clock is
 	// Now plus the time skipped with Advance.
 	Now func() time.Time
+	// PrimaryDown simulates a SQLite outage: writes fail, and a check that
+	// needs SQLite fails unless a cached snapshot satisfies it.
+	PrimaryDown bool
 
 	start       time.Time
 	skew        time.Duration
@@ -206,6 +216,42 @@ func validate(subject, object string) error {
 	return nil
 }
 
+// UnavailableError is returned while SQLite is down when the request can't
+// be answered without it: a write, or a check for which no cached snapshot
+// satisfies the requested revision. The API maps it to HTTP 503.
+type UnavailableError struct {
+	Message string `json:"message"`
+	Subject string `json:"subject"`
+	Object  string `json:"object"`
+	// RequiredRev is the revision the request asked for (0 for a write or a
+	// strategy without tokens); SnapshotRev is the cached snapshot's revision
+	// (0 when nothing is cached).
+	RequiredRev int64   `json:"requiredRev"`
+	SnapshotRev int64   `json:"snapshotRev"`
+	LatestToken int64   `json:"latestToken,omitempty"`
+	TokenSource string  `json:"tokenSource,omitempty"`
+	Consistency string  `json:"consistency,omitempty"`
+	LatencyMs   float64 `json:"latencyMs"`
+	Hops        []Hop   `json:"hops"`
+}
+
+func (e *UnavailableError) Error() string { return e.Message }
+
+type PrimaryResult struct {
+	Down bool   `json:"down"`
+	Note string `json:"note"`
+	Hops []Hop  `json:"hops"`
+}
+
+// SetPrimaryDown takes SQLite down or brings it back.
+func (d *Demo) SetPrimaryDown(down bool) PrimaryResult {
+	d.PrimaryDown = down
+	if down {
+		return PrimaryResult{Down: true, Hops: []Hop{}, Note: "SQLite is down. Writes fail. A check is answered only if a cached snapshot is at least as fresh as the revision it asks for; otherwise the API returns 503."}
+	}
+	return PrimaryResult{Hops: []Hop{}, Note: "SQLite is back. Checks that need it read it again and refresh the cache."}
+}
+
 type WriteResult struct {
 	Op    string `json:"op"`
 	Tuple string `json:"tuple"`
@@ -246,6 +292,10 @@ func (d *Demo) change(op store.Op, subject, object string) (WriteResult, error) 
 		return WriteResult{}, err
 	}
 	t := store.Tuple{Object: object, Relation: "viewer", Subject: subject}
+	if d.PrimaryDown {
+		h := Hop{From: "admin", To: "primary", Label: fmt.Sprintf("SQLite commit: %s %s → unavailable (timed out)", op, t), Ms: PrimaryTimeoutMs, Kind: "fail"}
+		return WriteResult{}, &UnavailableError{Message: fmt.Sprintf("SQLite is unavailable: %s %s was not committed.", op, t), Subject: subject, Object: object, LatencyMs: h.Ms, Hops: []Hop{h}}
+	}
 	c, err := d.Store.Write(op, t)
 	if err != nil {
 		return WriteResult{}, err
@@ -356,6 +406,9 @@ type CheckResult struct {
 	// ContractMet: the decision was evaluated at a revision ≥ the token in
 	// the request (the revision-aware promise; not a promise of the latest).
 	ContractMet bool `json:"contractMet"`
+	// PrimaryDown: SQLite was down, so the check was answered from a cached
+	// snapshot that satisfies the request.
+	PrimaryDown bool `json:"primaryDown"`
 }
 
 // CheckOpts are request options of the revision-aware strategy.
@@ -411,6 +464,8 @@ func (d *Demo) CheckWith(subject, object string, opts CheckOpts) (CheckResult, e
 		}
 	}
 	d.seq++
+	// The ground truth is read even while SQLite is "down": it is the
+	// simulation's oracle, off the request path.
 	truth, err := d.Store.CanView(subject, object)
 	if err != nil {
 		return CheckResult{}, err
@@ -478,6 +533,10 @@ func (d *Demo) CheckWith(subject, object string, opts CheckOpts) (CheckResult, e
 		hop(Hop{From: "cache", To: "checkapi", Label: fmt.Sprintf("compare entry rev %d with %s → %s", entry.Rev, with, verdict), Ms: RevCompareMs, Kind: kind})
 	}
 
+	if d.PrimaryDown && !serveCache {
+		return CheckResult{}, d.unavailable(r, hit, entry, opts.FullyConsistent)
+	}
+
 	if serveCache {
 		r.ServedBy, r.Decision, r.EvaluatedRev = "cache", entry.Decision, entry.Rev
 		switch {
@@ -495,6 +554,17 @@ func (d *Demo) CheckWith(subject, object string, opts CheckOpts) (CheckResult, e
 			r.Reason = fmt.Sprintf("Cache hit: cached %.0f s ago at rev %d, expires in %.0f s (TTL %d s). Served without asking SQLite.", r.EntryAgeSec, entry.Rev, CacheTTLSec-r.EntryAgeSec, CacheTTLSec)
 		default:
 			r.Reason = fmt.Sprintf("Cache hit (computed at rev %d, TTL %d s): served without asking SQLite.", entry.Rev, CacheTTLSec)
+		}
+		if d.PrimaryDown {
+			r.PrimaryDown = true
+			switch {
+			case d.Strategy == RevisionAware && entry.Rev < r.LatestToken:
+				r.Reason = fmt.Sprintf("SQLite is unavailable, but the cached snapshot (rev %d) is at least as fresh as the requested ver#%d, so the check is answered from it. %s is already at ver#%d: the answer is as fresh as the request asked for, not necessarily the latest.", entry.Rev, r.RequiredRev, object, r.LatestToken)
+			case d.Strategy == RevisionAware:
+				r.Reason = fmt.Sprintf("SQLite is unavailable, but the cached snapshot (rev %d) is at least as fresh as the requested ver#%d, so the check is answered from it. It also reflects %s's latest version.", entry.Rev, r.RequiredRev, object)
+			default:
+				r.Reason = fmt.Sprintf("SQLite is unavailable; the cache answers from its entry (rev %d) without knowing how fresh it is. %s", entry.Rev, r.Reason)
+			}
 		}
 	} else {
 		r.ServedBy, r.Decision, r.EvaluatedRev = "primary", decision(truth), r.PrimaryRev
@@ -541,6 +611,33 @@ func (d *Demo) CheckWith(subject, object string, opts CheckOpts) (CheckResult, e
 	return r, nil
 }
 
+// unavailable builds the 503 for a check that needs SQLite while it is down:
+// no cached snapshot satisfies the requested revision.
+func (d *Demo) unavailable(r CheckResult, hit bool, entry CacheEntry, fullyConsistent bool) *UnavailableError {
+	e := &UnavailableError{Subject: r.Subject, Object: r.Object, RequiredRev: r.RequiredRev, LatestToken: r.LatestToken, TokenSource: r.TokenSource, Consistency: r.Consistency, Hops: r.Hops, LatencyMs: r.LatencyMs}
+	pair := fmt.Sprintf("%s → %s", r.Subject, r.Object)
+	switch {
+	case fullyConsistent:
+		e.Message = fmt.Sprintf("SQLite is unavailable. A fully consistent check must read SQLite at its latest revision, so no cached snapshot can answer it (%s).", pair)
+	case d.Strategy != RevisionAware:
+		// These strategies serve any hit, so only a miss gets here.
+		e.Message = fmt.Sprintf("SQLite is unavailable and there is no cached entry for %s.", pair)
+	case hit:
+		e.SnapshotRev = entry.Rev
+		e.Message = fmt.Sprintf("SQLite is unavailable and no snapshot satisfies the revision: the cached snapshot for %s is at rev %d, older than the requested ver#%d.", pair, entry.Rev, r.RequiredRev)
+	default:
+		e.Message = fmt.Sprintf("SQLite is unavailable and no snapshot satisfies the revision: there is no cached snapshot for %s (requested ver#%d).", pair, r.RequiredRev)
+	}
+	for _, h := range []Hop{
+		{From: "checkapi", To: "primary", Label: "SQLite query → unavailable (timed out)", Ms: PrimaryTimeoutMs, Kind: "fail"},
+		{From: "checkapi", To: "client", Label: "503 Service Unavailable", Ms: NetworkMs, Kind: "fail"},
+	} {
+		e.Hops = append(e.Hops, h)
+		e.LatencyMs += h.Ms
+	}
+	return e
+}
+
 // happyPath is the same check had the pending invalidation been delivered
 // before the read: the entry is gone, so the lookup misses and SQLite answers.
 func happyPath(r CheckResult) *HappyPath {
@@ -574,11 +671,12 @@ type State struct {
 	TTLSec     int              `json:"ttlSec"`
 	EnforceTTL bool             `json:"enforceTTL"`
 	// ClockSec is the simulated time since the world was created.
-	ClockSec float64 `json:"clockSec"`
+	ClockSec    float64 `json:"clockSec"`
+	PrimaryDown bool    `json:"primaryDown"`
 }
 
 func (d *Demo) State() (State, error) {
-	s := State{Strategy: d.Strategy, PrimaryRev: d.Store.Rev(), Tuples: []string{}, Cache: []CacheEntry{}, TTLSec: CacheTTLSec, EnforceTTL: d.EnforceTTL, ClockSec: d.ClockSec()}
+	s := State{Strategy: d.Strategy, PrimaryRev: d.Store.Rev(), Tuples: []string{}, Cache: []CacheEntry{}, TTLSec: CacheTTLSec, EnforceTTL: d.EnforceTTL, ClockSec: d.ClockSec(), PrimaryDown: d.PrimaryDown}
 	s.Delivered, s.Queued = d.Queue.Snapshot()
 	tuples, err := d.Store.Tuples()
 	if err != nil {

@@ -1,8 +1,10 @@
 package demo
 
 import (
+	"errors"
 	"fmt"
 	"math/rand/v2"
+	"strings"
 	"time"
 )
 
@@ -212,7 +214,88 @@ func scenarioCases() ([]TestCase, error) {
 		fmt.Sprintf("A fully consistent check skips the cache and asks SQLite at its latest revision: correct, at %.1f ms instead of %.1f ms for a cache hit.", tok.strong.LatencyMs, 2*NetworkMs+CacheHitMs),
 		tok.strong.Correct && tok.strong.ServedBy == "primary" && tok.strong.Consistency == "fully_consistent" && strongNoCache,
 		describe(tok.strong))
+
+	out, err := outageStory()
+	if err != nil {
+		return nil, err
+	}
+	add(RevisionAware, "SQLite outage: a snapshot at least as fresh as the request's token still answers",
+		fmt.Sprintf("Alice's ALLOW was cached at rev %d. With SQLite down, her check with token ver#%d is answered from that snapshot: no SQLite hop, still correct.", out.old.CacheRev, out.old.RequiredRev),
+		out.old.PrimaryDown && out.old.ServedBy == "cache" && out.old.Correct && out.old.ContractMet && !touches(out.old.Hops, "primary"),
+		describe(out.old))
+	unavailable := []string{}
+	for _, e := range out.failed {
+		unavailable = append(unavailable, fmt.Sprintf("%s → 503: %s", e.Subject, e.Message))
+	}
+	add(RevisionAware, "SQLite outage: no snapshot satisfies the revision → 503",
+		"With SQLite down, the API returns 503 instead of guessing when the cached snapshot is older than the requested version, when nothing is cached, for a fully consistent check, and for a write.",
+		len(out.failed) == 4 &&
+			out.failed[0].SnapshotRev == out.old.CacheRev && out.failed[0].RequiredRev > out.failed[0].SnapshotRev &&
+			out.failed[1].SnapshotRev == 0 && out.failed[2].Consistency == "fully_consistent" &&
+			strings.Contains(out.failed[0].Message, "no snapshot satisfies the revision"),
+		unavailable...)
+	add(RevisionAware, "SQLite recovery: the next check reads SQLite again",
+		"Once SQLite is back, the check with the latest token that got a 503 falls back to SQLite, answers correctly and refreshes the snapshot.",
+		out.recovered.ServedBy == "primary" && out.recovered.Correct && !out.recovered.PrimaryDown,
+		describe(out.recovered))
 	return cases, nil
+}
+
+func touches(hops []Hop, box string) bool {
+	for _, h := range hops {
+		if h.From == box || h.To == box {
+			return true
+		}
+	}
+	return false
+}
+
+type outageResults struct {
+	old       CheckResult
+	failed    []*UnavailableError
+	recovered CheckResult
+}
+
+// outageStory: Alice reads doc:42 (her client keeps ver#3), Carol is granted
+// doc:42 (ver#4), then SQLite goes down. Alice checks with her token, then
+// requests that no snapshot satisfies are made, then SQLite comes back.
+func outageStory() (outageResults, error) {
+	var out outageResults
+	d, err := New(RevisionAware)
+	if err != nil {
+		return out, err
+	}
+	defer d.Close()
+	d.ClientTokens = true
+	first, err := d.Check("user:alice", "doc:42")
+	if err != nil {
+		return out, err
+	}
+	if _, err := d.Grant("user:carol", "doc:42"); err != nil {
+		return out, err
+	}
+	d.SetPrimaryDown(true)
+	if out.old, err = d.CheckWith("user:alice", "doc:42", CheckOpts{Token: first.LatestToken}); err != nil {
+		return out, err
+	}
+	for _, f := range []func() error{
+		func() error { _, err := d.Check("user:alice", "doc:42"); return err },
+		func() error { _, err := d.Check("user:carol", "doc:42"); return err },
+		func() error {
+			_, err := d.CheckWith("user:alice", "doc:42", CheckOpts{FullyConsistent: true})
+			return err
+		},
+		func() error { _, err := d.Revoke("user:carol", "doc:42"); return err },
+	} {
+		var ue *UnavailableError
+		if err := f(); !errors.As(err, &ue) {
+			return out, fmt.Errorf("want a 503 while SQLite is down, got %v", err)
+		}
+		out.failed = append(out.failed, ue)
+	}
+	d.SetPrimaryDown(false)
+	out.recovered, err = d.Check("user:alice", "doc:42")
+	return out, err
 }
 
 type tokenResults struct{ old, latest, strong CheckResult }
