@@ -3,7 +3,9 @@ package demo
 import (
 	"errors"
 	"fmt"
+	"math"
 	"math/rand/v2"
+	"slices"
 	"strings"
 	"time"
 )
@@ -19,14 +21,32 @@ type TestCase struct {
 }
 
 type StrategyStats struct {
-	Checks      int     `json:"checks"`
-	Wrong       int     `json:"wrong"`       // decisions that differ from SQLite
-	StaleAllows int     `json:"staleAllows"` // ALLOW where SQLite says DENY
-	InWindow    int     `json:"inWindow"`    // wrong decisions made while the user's invalidation was still queued
-	CacheHits   int     `json:"cacheHits"`
-	Fallbacks   int     `json:"fallbacks"` // stale entries refused (revision-aware only)
-	MeanMs      float64 `json:"meanMs"`
-	HitRatePct  float64 `json:"hitRatePct"`
+	Checks      int `json:"checks"`
+	Wrong       int `json:"wrong"`       // decisions that differ from SQLite
+	StaleAllows int `json:"staleAllows"` // ALLOW where SQLite says DENY
+	InWindow    int `json:"inWindow"`    // wrong decisions made while the user's invalidation was still queued
+	CacheHits   int `json:"cacheHits"`
+	Fallbacks   int `json:"fallbacks"` // stale entries refused (revision-aware only)
+	// P50Ms and P99Ms are latency percentiles over every check (nearest rank).
+	P50Ms      float64 `json:"p50Ms"`
+	P99Ms      float64 `json:"p99Ms"`
+	HitRatePct float64 `json:"hitRatePct"`
+
+	latencies []float64
+}
+
+// observe records one check's latency.
+func (s *StrategyStats) observe(ms float64) { s.latencies = append(s.latencies, ms) }
+
+// percentile is the nearest-rank p-th percentile of the recorded latencies.
+func (s *StrategyStats) percentile(p float64) float64 {
+	if len(s.latencies) == 0 {
+		return 0
+	}
+	v := slices.Clone(s.latencies)
+	slices.Sort(v)
+	rank := int(math.Ceil(p / 100 * float64(len(v))))
+	return v[max(rank, 1)-1]
 }
 
 type PropertyStats struct {
@@ -414,7 +434,7 @@ func propertyRun(seed uint64, ops int, ps *PropertyStats) error {
 			}
 			fc := ps.FullyConsistent
 			fc.Checks++
-			fc.MeanMs += res.LatencyMs
+			fc.observe(res.LatencyMs)
 			if !res.Correct {
 				fc.Wrong++
 			}
@@ -428,7 +448,7 @@ func propertyRun(seed uint64, ops int, ps *PropertyStats) error {
 				}
 				s := ps.ByStrat[d.Strategy]
 				s.Checks++
-				s.MeanMs += res.LatencyMs
+				s.observe(res.LatencyMs)
 				if !res.Correct {
 					s.Wrong++
 					if res.Pending != nil {
@@ -462,14 +482,14 @@ func propertyCases() ([]TestCase, PropertyStats, error) {
 	}
 	for _, s := range append([]*StrategyStats{ps.FullyConsistent}, values(ps.ByStrat)...) {
 		if s.Checks > 0 {
-			s.MeanMs /= float64(s.Checks)
+			s.P50Ms, s.P99Ms = s.percentile(50), s.percentile(99)
 			s.HitRatePct = 100 * float64(s.CacheHits) / float64(s.Checks)
 		}
 	}
 	summary := func(s Strategy) string {
 		st := ps.ByStrat[s]
-		return fmt.Sprintf("%s: %d checks, %d wrong (%d stale ALLOWs, %d while the invalidation was queued), cache hit rate %.1f%%, %d fallbacks, mean latency %.2f ms",
-			s, st.Checks, st.Wrong, st.StaleAllows, st.InWindow, st.HitRatePct, st.Fallbacks, st.MeanMs)
+		return fmt.Sprintf("%s: %d checks, %d wrong (%d stale ALLOWs, %d while the invalidation was queued), cache hit rate %.1f%%, %d fallbacks, p50 %.2f ms, p99 %.2f ms",
+			s, st.Checks, st.Wrong, st.StaleAllows, st.InWindow, st.HitRatePct, st.Fallbacks, st.P50Ms, st.P99Ms)
 	}
 	ttl, inv, ra, fc := ps.ByStrat[TTL], ps.ByStrat[Invalidation], ps.ByStrat[RevisionAware], ps.FullyConsistent
 	workload := fmt.Sprintf("%d random workloads × %d operations (grants, revokes, invalidation deliveries and checks for %d users on %d documents)", ps.Seeds, ps.OpsPerRun, len(Users), len(Docs))
@@ -488,9 +508,10 @@ func propertyCases() ([]TestCase, PropertyStats, error) {
 		},
 		{
 			Name: "Property: fully consistent reads are always correct, but never use the cache", Kind: "property", Strategy: RevisionAware,
-			Description: "The same workloads, checked fully consistently: every decision matches SQLite, but the cache hit rate is 0% and every check pays the primary round trip. Latest-ness costs scalability.",
-			Passed:      fc.Checks > 0 && fc.Wrong == 0 && fc.CacheHits == 0 && fc.MeanMs > ra.MeanMs,
-			Details:     []string{fmt.Sprintf("fully consistent: %d checks, %d wrong, cache hit rate %.1f%%, mean latency %.2f ms (revision-aware: %.2f ms)", fc.Checks, fc.Wrong, fc.HitRatePct, fc.MeanMs, ra.MeanMs)},
+			Description: "The same workloads, checked fully consistently: every decision matches SQLite, but the cache hit rate is 0%. At p99 both pay one SQLite round trip; the difference is that a fully consistent read pays it on every check, so its median is the SQLite path too and SQLite serves all the read load. Latest-ness costs scalability.",
+			Passed:      fc.Checks > 0 && fc.Wrong == 0 && fc.CacheHits == 0 && fc.P50Ms > ra.P50Ms,
+			Details: []string{fmt.Sprintf("fully consistent: %d checks, %d wrong, cache hit rate %.1f%% (all %d checks read SQLite), p50 %.2f ms, p99 %.2f ms", fc.Checks, fc.Wrong, fc.HitRatePct, fc.Checks, fc.P50Ms, fc.P99Ms),
+				fmt.Sprintf("revision-aware: %d of %d checks read SQLite, p50 %.2f ms, p99 %.2f ms", ra.Checks-ra.CacheHits, ra.Checks, ra.P50Ms, ra.P99Ms)},
 		},
 		{
 			Name: "Property sanity: the same workloads catch the TTL cache", Kind: "property", Strategy: TTL,

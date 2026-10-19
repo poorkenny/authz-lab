@@ -31,7 +31,8 @@ export function TestsPanel({ section }: { section: number }) {
     ["wrong while the invalidation was queued", (s) => s.inWindow.toLocaleString()],
     ["cache hit rate", (s) => `${s.hitRatePct.toFixed(1)}%`],
     ["fallbacks to SQLite", (s) => s.fallbacks.toLocaleString()],
-    ["mean check latency", (s) => `${s.meanMs.toFixed(2)} ms`],
+    ["p50 check latency", (s) => `${s.p50Ms.toFixed(2)} ms`],
+    ["p99 check latency", (s) => `${s.p99Ms.toFixed(2)} ms`],
   ];
 
   return (

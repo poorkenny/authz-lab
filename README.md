@@ -71,7 +71,7 @@ The revision-aware strategy makes one promise: **a check is evaluated at a versi
 | Latest token ver#4 | DENY | SQLite (fallback, then cached) | 16.3 ms | ✓ evaluated at rev 4 ≥ ver#4 |
 | Fully consistent | DENY | SQLite, every time | 16.0 ms | latest, but no cache offload |
 
-Getting the latest decision every time requires strong consistency: every check goes to the single source of truth. That gives up the scalability the cache provides. On the property-test workloads, fully consistent checks are never wrong, but the cache hit rate is 0% and every check costs about 16 ms, against a mean of 4.5 ms for revision-aware.
+Getting the latest decision every time requires strong consistency: every check goes to the single source of truth. That gives up the scalability the cache provides. On the property-test workloads, fully consistent checks are never wrong, but the cache hit rate is 0%. Both strategies have a p99 of about 16 ms (one SQLite round trip), but fully consistent pays it on every check: its p50 is 16.0 ms against 1.21 ms for revision-aware, and SQLite serves 100% of the checks instead of 21.9%.
 
 "Explore freely" has a **request token** selector (latest, any ver#N, or fully consistent) for revision-aware checks.
 
@@ -146,9 +146,12 @@ Property-test results (identical seeded workloads of grants, revokes, deliveries
 |---|---|---|---|
 | wrong decisions | 2,579 | 361 (all while the user's event was queued) | **0** |
 | cache hit rate | 98.0% | 90.6% | 78.1% |
-| mean check latency | 1.50 ms | 2.62 ms | 4.51 ms |
+| p50 check latency | 1.20 ms | 1.20 ms | 1.21 ms |
+| p99 check latency | 16.30 ms | 16.30 ms | 16.31 ms |
 
-Invalidation looks cheaper than revision-aware because it keeps serving cached entries until their event is delivered. Those are exactly the reads where it was wrong. Revision-aware pays an extra SQLite round trip right after each change and is never wrong.
+The suite reports p99 rather than the mean, because production latency targets are set on the tail. At p99 every strategy pays the same SQLite round trip, so they tie: a cache does not shorten the tail, it only makes it rarer. The difference is how often the slow path runs: revision-aware's p90 is already the SQLite path (16.31 ms, 21.9% of checks), against 1.20 ms for TTL and invalidation. Those keep serving cached entries until the TTL runs out or the event is delivered, and those are exactly the reads where they were wrong. Revision-aware pays an extra SQLite round trip right after each change and is never wrong.
+
+The modelled hop latencies are fixed, with no jitter or queueing, so p99 is exactly the miss path here. In production the SQLite path itself has a tail, and it grows with the share of checks sent to SQLite.
 
 ---
 
