@@ -32,11 +32,14 @@ type Flags struct {
 	// check is still answered from a cached snapshot at least as fresh as the
 	// requested revision; otherwise the API returns 503.
 	SQLiteFailure bool `json:"sqliteFailure"`
+	// LogReplay: the benchmark section can replay an uploaded log of
+	// permission grants, revocations and checks against every strategy.
+	LogReplay bool `json:"logReplay"`
 }
 
 // Defaults are the flag values used when no environment variable is set.
 func Defaults() Flags {
-	return Flags{ControlledCacheDelivery: true, StrategyStories: true, HappyPathComparison: true, ClientVersionToken: true, SQLiteFailure: true}
+	return Flags{ControlledCacheDelivery: true, StrategyStories: true, HappyPathComparison: true, ClientVersionToken: true, SQLiteFailure: true, LogReplay: true}
 }
 
 // FromEnv reads flags from environment variables, falling back to Defaults
@@ -48,6 +51,7 @@ func FromEnv(getenv func(string) string) Flags {
 	f.HappyPathComparison = boolFlag(getenv, "FEATURE_HAPPY_PATH_COMPARISON", f.HappyPathComparison)
 	f.ClientVersionToken = boolFlag(getenv, "FEATURE_CLIENT_VERSION_TOKEN", f.ClientVersionToken)
 	f.SQLiteFailure = boolFlag(getenv, "FEATURE_SQLITE_FAILURE", f.SQLiteFailure)
+	f.LogReplay = boolFlag(getenv, "FEATURE_LOG_REPLAY", f.LogReplay)
 	return f
 }
 

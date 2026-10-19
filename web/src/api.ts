@@ -1,4 +1,4 @@
-import type { CheckOpts, CheckResult, ClockResult, CompareRow, DeliverResult, Features, PrimaryResult, State, Strategy, SuiteResult, WriteResult } from "./types";
+import type { CheckOpts, CheckResult, ClockResult, CompareRow, DeliverResult, Features, PrimaryResult, ReplayResult, State, Strategy, SuiteResult, WriteResult } from "./types";
 
 const SESSION_KEY = "authz-lab-session";
 let memorySession = "";
@@ -61,6 +61,8 @@ export const api = {
   advanceClock: (seconds: number) => call<ClockResult>("POST", "/api/v1/clock/advance", { seconds }),
   compare: () => call<{ rows: CompareRow[] }>("GET", "/api/v1/compare"),
   runTests: () => call<SuiteResult>("POST", "/api/v1/tests/run"),
+  sampleLog: () => call<{ log: string; invalidationMs: number }>("GET", "/api/v1/tests/sample-log"),
+  replay: (log: string, invalidationMs: number) => call<ReplayResult>("POST", "/api/v1/tests/replay", { log, invalidationMs }),
   sim: {
     ...world("/api/v1/sim"),
     otherWrites: (count: number) => call<WriteResult[]>("POST", "/api/v1/sim/other-writes", { count }),

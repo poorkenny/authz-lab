@@ -20,6 +20,7 @@ func TestFromEnv(t *testing.T) {
 		"FEATURE_HAPPY_PATH_COMPARISON":     func(f Flags) bool { return f.HappyPathComparison },
 		"FEATURE_CLIENT_VERSION_TOKEN":      func(f Flags) bool { return f.ClientVersionToken },
 		"FEATURE_SQLITE_FAILURE":            func(f Flags) bool { return f.SQLiteFailure },
+		"FEATURE_LOG_REPLAY":                func(f Flags) bool { return f.LogReplay },
 	}
 	for name, get := range flags {
 		for _, c := range cases {

@@ -21,6 +21,7 @@ import (
 
 const (
 	maxBody     = 16 << 10
+	maxLogBody  = 2 << 20 // an uploaded log for the benchmark replay
 	maxSessions = 500
 	sessionTTL  = 30 * time.Minute
 	ratePerSec  = 10
@@ -167,6 +168,14 @@ func newOutage() (*demo.Demo, error) {
 func (s *Server) requireSQLiteFailure() error {
 	if !s.flags.SQLiteFailure {
 		return httpError{http.StatusNotFound, "the SQLite failure simulation is disabled (FEATURE_SQLITE_FAILURE=false)"}
+	}
+	return nil
+}
+
+// requireLogReplay rejects benchmark log uploads when their flag is off.
+func (s *Server) requireLogReplay() error {
+	if !s.flags.LogReplay {
+		return httpError{http.StatusNotFound, "log replay is disabled (FEATURE_LOG_REPLAY=false)"}
 	}
 	return nil
 }
@@ -328,10 +337,42 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/tests/run", s.with(mainWorld, func(r *http.Request, _ **demo.Demo) (any, error) {
 		// Reject instead of waiting, so requests can't pile up behind a run.
 		if !s.testRun.TryLock() {
-			return nil, httpError{http.StatusConflict, "Another correctness test run is in progress on this server. Try again in a few seconds."}
+			return nil, httpError{http.StatusConflict, "Another benchmark run is in progress on this server. Try again in a few seconds."}
 		}
 		defer s.testRun.Unlock()
 		return demo.RunSuite()
+	}))
+	mux.HandleFunc("GET /api/v1/tests/sample-log", s.with(mainWorld, func(r *http.Request, _ **demo.Demo) (any, error) {
+		if err := s.requireLogReplay(); err != nil {
+			return nil, err
+		}
+		return map[string]any{"log": demo.SampleLog, "invalidationMs": demo.DefaultInvalidationMs}, nil
+	}))
+	mux.HandleFunc("POST /api/v1/tests/replay", s.withBody(mainWorld, maxLogBody, func(r *http.Request, _ **demo.Demo) (any, error) {
+		if err := s.requireLogReplay(); err != nil {
+			return nil, err
+		}
+		req := struct {
+			Log            string `json:"log"`
+			InvalidationMs *int   `json:"invalidationMs"`
+		}{}
+		if err := decode(r, &req); err != nil {
+			return nil, err
+		}
+		ms := demo.DefaultInvalidationMs
+		if req.InvalidationMs != nil {
+			ms = *req.InvalidationMs
+		}
+		// Shares the suite's lock: one benchmark run at a time per server.
+		if !s.testRun.TryLock() {
+			return nil, httpError{http.StatusConflict, "Another benchmark run is in progress on this server. Try again in a few seconds."}
+		}
+		defer s.testRun.Unlock()
+		out, err := demo.Replay(req.Log, ms)
+		if err != nil {
+			return nil, badRequest(err)
+		}
+		return out, nil
 	}))
 }
 
@@ -346,6 +387,11 @@ func badRequest(err error) error { return httpError{http.StatusBadRequest, err.E
 
 // with resolves the session, rate-limits it and serializes access to the chosen world.
 func (s *Server) with(wd world, h func(r *http.Request, d **demo.Demo) (any, error)) http.HandlerFunc {
+	return s.withBody(wd, maxBody, h)
+}
+
+// withBody is with, accepting request bodies of up to limit bytes.
+func (s *Server) withBody(wd world, limit int64, h func(r *http.Request, d **demo.Demo) (any, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get(sessionHdr)
 		if id == "" {
@@ -360,7 +406,7 @@ func (s *Server) with(wd world, h func(r *http.Request, d **demo.Demo) (any, err
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
-		r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
 		ss.mu.Lock()
 		defer ss.mu.Unlock()
 		if !ss.allow() {

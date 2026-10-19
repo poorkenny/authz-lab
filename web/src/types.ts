@@ -9,6 +9,7 @@ export interface Features {
   happyPathComparison: boolean;
   clientVersionToken: boolean;
   sqliteFailure: boolean;
+  logReplay: boolean;
 }
 
 export interface Hop {
@@ -143,6 +144,45 @@ export interface State {
   enforceTTL: boolean;
   clockSec: number;
   primaryDown: boolean;
+}
+
+// One strategy's results on a replayed log (FEATURE_LOG_REPLAY).
+export interface ReplayStats {
+  checks: number;
+  wrong: number;
+  staleAllows: number;
+  falseDenies: number;
+  cacheHits: number;
+  hitRatePct: number;
+  sqliteReads: number;
+  p50Ms: number;
+  p99Ms: number;
+  maxStaleSec: number;
+}
+
+// The decisions recorded in the log itself, evaluated against the replayed state.
+export interface ObservedStats {
+  checks: number;
+  wrong: number;
+  staleAllows: number;
+  falseDenies: number;
+  maxStaleSec: number;
+}
+
+export interface ReplayResult {
+  events: number;
+  grants: number;
+  revokes: number;
+  checks: number;
+  skipped: number;
+  issues: string[];
+  spanSec: number;
+  invalidationMs: number;
+  ttlSec: number;
+  byStrategy: Record<Strategy, ReplayStats>;
+  fullyConsistent: ReplayStats;
+  observed?: ObservedStats;
+  durationMs: number;
 }
 
 export interface CompareRow {

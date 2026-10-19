@@ -136,12 +136,11 @@ var (
 
 // New returns the starting world: Bob owns doc:42 and doc:7, Alice can view doc:42.
 func New(strategy Strategy) (*Demo, error) {
-	st, err := store.Open()
+	d, err := newEmpty(strategy)
 	if err != nil {
 		return nil, err
 	}
-	d := &Demo{Strategy: strategy, Store: st, Audit: &audit.Log{}, Queue: &Queue{}, Now: time.Now, start: time.Now(),
-		cache: map[string]CacheEntry{}, invalidated: map[string]QueueMsg{}, expired: map[string]bool{}}
+	st := d.Store
 	for _, t := range []store.Tuple{
 		{Object: "doc:42", Relation: "owner", Subject: "user:bob"},
 		{Object: "doc:7", Relation: "owner", Subject: "user:bob"},
@@ -153,6 +152,16 @@ func New(strategy Strategy) (*Demo, error) {
 		}
 	}
 	return d, nil
+}
+
+// newEmpty returns a world with an empty store (used to replay logs).
+func newEmpty(strategy Strategy) (*Demo, error) {
+	st, err := store.Open()
+	if err != nil {
+		return nil, err
+	}
+	return &Demo{Strategy: strategy, Store: st, Audit: &audit.Log{}, Queue: &Queue{}, Now: time.Now, start: time.Now(),
+		cache: map[string]CacheEntry{}, invalidated: map[string]QueueMsg{}, expired: map[string]bool{}}, nil
 }
 
 func (d *Demo) Close() error { return d.Store.Close() }

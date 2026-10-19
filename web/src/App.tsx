@@ -132,7 +132,7 @@ function pathOf(r: CheckResult): string {
 
 export default function App() {
   const [state, setState] = useState<State | null>(null);
-  const [flags, setFlags] = useState<Features>({ controlledCacheDelivery: true, strategyStories: true, happyPathComparison: true, clientVersionToken: true, sqliteFailure: true });
+  const [flags, setFlags] = useState<Features>({ controlledCacheDelivery: true, strategyStories: true, happyPathComparison: true, clientVersionToken: true, sqliteFailure: true, logReplay: true });
   const [held, setHeld] = useState(0);
   const [reqToken, setReqToken] = useState("latest");
   const [step, setStep] = useState(0);
@@ -571,7 +571,7 @@ export default function App() {
 
       {flags.sqliteFailure && <OutageSimulation section={controlled ? 4 : 3} />}
 
-      <TestsPanel section={3 + Number(controlled) + Number(flags.sqliteFailure)} />
+      <TestsPanel section={3 + Number(controlled) + Number(flags.sqliteFailure)} logReplay={flags.logReplay} />
 
       <footer className="muted small">Mock system with modelled latencies, backed by an in-memory SQLite store per browser session. {controlled ? "Invalidation events are delivered only when you click." : "Invalidation events are delivered automatically after each commit."}</footer>
     </div>
