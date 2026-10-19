@@ -3,6 +3,7 @@ import { api } from "./api";
 import type { CheckOpts, CheckResult, ClockResult, CompareRow, DeliverResult, Features, Hop, State, Strategy, WriteResult } from "./types";
 import { CacheFreshness } from "./components/CacheFreshness";
 import { FlowDiagram, fmtMs, hopMs, shortLabel } from "./components/FlowDiagram";
+import { OutageSimulation } from "./components/OutageSimulation";
 import { QueueSimulation } from "./components/QueueSimulation";
 import { TestsPanel } from "./components/TestsPanel";
 import { STRATEGIES, byId } from "./strategies";
@@ -131,7 +132,7 @@ function pathOf(r: CheckResult): string {
 
 export default function App() {
   const [state, setState] = useState<State | null>(null);
-  const [flags, setFlags] = useState<Features>({ controlledCacheDelivery: true, strategyStories: true, happyPathComparison: true, clientVersionToken: true });
+  const [flags, setFlags] = useState<Features>({ controlledCacheDelivery: true, strategyStories: true, happyPathComparison: true, clientVersionToken: true, sqliteFailure: true });
   const [held, setHeld] = useState(0);
   const [reqToken, setReqToken] = useState("latest");
   const [step, setStep] = useState(0);
@@ -562,7 +563,9 @@ export default function App() {
 
       {controlled && <QueueSimulation />}
 
-      <TestsPanel section={controlled ? 4 : 3} />
+      {flags.sqliteFailure && <OutageSimulation section={controlled ? 4 : 3} />}
+
+      <TestsPanel section={3 + Number(controlled) + Number(flags.sqliteFailure)} />
 
       <footer className="muted small">Mock system with modelled latencies, backed by an in-memory SQLite store per browser session. {controlled ? "Invalidation events are delivered only when you click." : "Invalidation events are delivered automatically after each commit."}</footer>
     </div>

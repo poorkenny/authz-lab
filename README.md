@@ -75,6 +75,28 @@ Getting the latest decision every time requires strong consistency: every check 
 
 "Explore freely" has a **request token** selector (latest, any ver#N, or fully consistent) for revision-aware checks.
 
+## Simulation: SQLite failure
+
+A separate world (revision-aware strategy) where you can **take SQLite down** (flag `FEATURE_SQLITE_FAILURE`). The failure handling rule: while SQLite is down, a check is answered from a cached snapshot only if the snapshot's revision is **equal to or newer than the revision the request asks for**. Otherwise the API returns **503** with *"no snapshot satisfies the revision"*, instead of guessing from an older snapshot.
+
+1. **Alice opens doc:42**: ALLOW is cached as a snapshot at rev 3, and her client keeps ver#3.
+2. **Admin grants Carol doc:42**: doc:42 moves to ver#4.
+3. **SQLite fails.**
+4. **Alice checks with her token ver#3**: 200, answered from the snapshot.
+5. **Alice checks with the latest token**: 503. The section also lets you try a check for Carol (nothing cached), a fully consistent check and a write.
+6. **SQLite recovers.**
+7. **Alice checks with the latest token again**: 200 from SQLite, and the snapshot is refreshed at rev 4.
+
+| Request (SQLite down) | Cached snapshot | Response |
+|---|---|---|
+| Alice, token ver#3 | rev 3 ≥ ver#3 | **200** ALLOW from the snapshot, 1.2 ms |
+| Alice, latest token ver#4 | rev 3 < ver#4 | **503** no snapshot satisfies the revision, 51.2 ms |
+| Carol, latest token ver#4 | none | **503** no snapshot satisfies the revision |
+| Alice, fully consistent | not usable | **503**: a fully consistent check always needs SQLite |
+| Admin revokes Carol | — | **503**: the write is not committed |
+
+The 503s include the modelled 50 ms SQLite timeout. A "Try your own request" row picks the user and the token (latest, any ver#N, or fully consistent), and a responses table records each request's HTTP status, the snapshot it was judged against and the answer.
+
 ## Simulation: read-after-write inconsistency in the invalidation queue
 
 A separate world (always the invalidation strategy) where you control the delivery queue directly: Alice reads, admin revokes / re-grants Alice, unrelated writes (+1 / +3) that queue their own events, and **Deliver next invalidation**, one event at a time in FIFO order. Every read records where Alice's invalidation sat in the queue at that moment.
@@ -110,6 +132,9 @@ A separate world (always the invalidation strategy) where you control the delive
 | An old token in the request can still read a result that is not the latest | Revision-aware | the promise is "at least as fresh as the token", not "the latest" |
 | The latest token makes the same check fresh | Revision-aware | fallback to SQLite, DENY |
 | Fully consistent: always the latest, never from the cache | Revision-aware | strong consistency skips the cache |
+| SQLite outage: a snapshot at least as fresh as the request's token still answers | Revision-aware | 200 from the snapshot, no SQLite hop |
+| SQLite outage: no snapshot satisfies the revision → 503 | Revision-aware | older snapshot, no snapshot, fully consistent check and write all fail with 503 |
+| SQLite recovery: the next check reads SQLite again | Revision-aware | fallback to SQLite, snapshot refreshed |
 | Revision-aware decisions always match SQLite | property | 30 seeds × 400 random ops, each check with the doc's latest token: **0 wrong** |
 | Fully consistent reads are always correct, but never use the cache | property | 0 wrong, 0% cache hits, every check on SQLite |
 | Invalidation mitigates, but cannot eliminate, stale decisions | property | far fewer mistakes than TTL, every one while the user's event was queued |
@@ -137,6 +162,7 @@ Every feature ships behind a flag; see **[docs/FEATURES.md](docs/FEATURES.md)** 
 | `FEATURE_STRATEGY_STORIES` | `true` | Each strategy gets its own story. TTL: no delivery step; entries expire on a simulated clock, with a TTL and freshness panel and a fast-forward step. Off: one shared story for all strategies. |
 | `FEATURE_HAPPY_PATH_COMPARISON` | `true` | An invalidation read made while its event is queued also returns the happy-path result, shown side by side. Off: only the read's own result. |
 | `FEATURE_CLIENT_VERSION_TOKEN` | `true` | A revision-aware check can carry the client's own (possibly old) version token, or ask for a fully consistent read; the revision-aware story shows "at least as fresh as the token, not the latest". Off: checks always use the doc's latest token. |
+| `FEATURE_SQLITE_FAILURE` | `true` | A separate simulation where SQLite can be taken down: a check is answered from a cached snapshot at least as fresh as the requested revision, otherwise `503` ("no snapshot satisfies the revision"). Off: the section and the `/api/v1/outage/*` endpoints (404) are gone. |
 | `FEATURE_AUTH` | `false` | *Planned*: authentication and user management (see [TODO.md](TODO.md)). |
 
 ## Run locally
@@ -169,6 +195,8 @@ All endpoints accept an `X-Lab-Session` header. Each session has two worlds, eac
 | `POST /api/v1/tests/run` | run the correctness suite (one run at a time per server; `409` while another run is in progress) |
 | `/api/v1/sim/{state,reset,check,grant,revoke,deliver}` | the same operations on the queue-simulation world (flag `FEATURE_CONTROLLED_CACHE_DELIVERY`) |
 | `POST /api/v1/sim/other-writes {count}` | commit 1–10 unrelated writes, each queueing its own invalidation event |
+| `/api/v1/outage/{state,reset,check,grant,revoke}` | the SQLite-failure world (revision-aware; `check` takes `token` and `consistency`). While SQLite is down, a check that no cached snapshot satisfies, and every write, returns `503` with an `unavailable` object (`requiredRev`, `snapshotRev`, `hops`, …) (flag `FEATURE_SQLITE_FAILURE`) |
+| `POST /api/v1/outage/primary {down}` | take SQLite down (`true`) or bring it back (`false`) |
 
 ```bash
 H='X-Lab-Session: demo'; B=http://localhost:8080

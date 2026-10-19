@@ -193,3 +193,44 @@ func TestClientVersionTokenFlag(t *testing.T) {
 		t.Errorf("token with the TTL strategy = %d, want 400", code)
 	}
 }
+
+func TestSQLiteFailureFlag(t *testing.T) {
+	off := serve(t, features.Flags{SQLiteFailure: false})
+	for _, path := range []string{"/api/v1/outage/primary", "/api/v1/outage/check"} {
+		if code, _ := call(t, off, "POST", path, `{"down":true}`); code != http.StatusNotFound {
+			t.Errorf("flag off: POST %s = %d, want 404", path, code)
+		}
+	}
+
+	// Client version tokens are always on in this simulation, whatever their own flag says.
+	on := serve(t, features.Flags{SQLiteFailure: true})
+	call(t, on, "POST", "/api/v1/outage/check", `{"subject":"user:alice","object":"doc:42"}`) // ALLOW cached at rev 3
+	call(t, on, "POST", "/api/v1/outage/grant", `{"subject":"user:carol","object":"doc:42"}`) // doc:42 → ver#4
+	if code, p := call(t, on, "POST", "/api/v1/outage/primary", `{"down":true}`); code != http.StatusOK || p["down"] != true {
+		t.Fatalf("take SQLite down: %d %v", code, p)
+	}
+	if _, st := call(t, on, "GET", "/api/v1/outage/state", ""); st["primaryDown"] != true {
+		t.Errorf("state should report SQLite down, got %v", st["primaryDown"])
+	}
+	code, r := call(t, on, "POST", "/api/v1/outage/check", `{"subject":"user:alice","object":"doc:42","token":3}`)
+	if code != http.StatusOK || r["servedBy"] != "cache" || r["primaryDown"] != true {
+		t.Errorf("token ver#3 with SQLite down: %d %v via %v, want 200 from the snapshot", code, r["decision"], r["servedBy"])
+	}
+	code, r = call(t, on, "POST", "/api/v1/outage/check", `{"subject":"user:alice","object":"doc:42"}`)
+	ue, _ := r["unavailable"].(map[string]any)
+	if code != http.StatusServiceUnavailable || !strings.Contains(r["error"].(string), "no snapshot satisfies the revision") ||
+		ue["snapshotRev"] != float64(3) || ue["requiredRev"] != float64(4) {
+		t.Errorf("latest token with SQLite down: %d %v, want 503 (snapshot rev 3 < ver#4)", code, r)
+	}
+	if code, _ := call(t, on, "POST", "/api/v1/outage/revoke", `{"subject":"user:carol","object":"doc:42"}`); code != http.StatusServiceUnavailable {
+		t.Errorf("write with SQLite down = %d, want 503", code)
+	}
+	call(t, on, "POST", "/api/v1/outage/primary", `{"down":false}`)
+	if code, r := call(t, on, "POST", "/api/v1/outage/check", `{"subject":"user:alice","object":"doc:42"}`); code != http.StatusOK || r["servedBy"] != "primary" {
+		t.Errorf("after recovery: %d via %v, want 200 from SQLite", code, r["servedBy"])
+	}
+	// The main demo is not affected by the outage world.
+	if code, r := call(t, on, "POST", "/api/v1/check", `{"subject":"user:alice","object":"doc:42"}`); code != http.StatusOK || r["primaryDown"] != false {
+		t.Errorf("main demo: %d %v", code, r)
+	}
+}

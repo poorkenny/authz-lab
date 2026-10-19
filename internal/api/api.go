@@ -1,8 +1,9 @@
 // Package api exposes the strategy showcase over HTTP. Every request is
 // scoped to a reviewer session via the X-Lab-Session header (the UI generates
 // one per browser), so reviewers on a shared instance never see each other's
-// state. A session holds two worlds: the main demo (any strategy) and the
-// invalidation-queue simulation (always the invalidation strategy).
+// state. A session holds up to three worlds: the main demo (any strategy),
+// the invalidation-queue simulation (always the invalidation strategy) and
+// the SQLite-failure simulation (revision-aware, created on first use).
 package api
 
 import (
@@ -33,6 +34,7 @@ type session struct {
 	mu       sync.Mutex
 	demo     *demo.Demo
 	sim      *demo.Demo
+	outage   *demo.Demo // nil until the SQLite-failure simulation is used
 	lastUsed time.Time
 	tokens   float64
 	tokensAt time.Time
@@ -114,6 +116,9 @@ func (s *Server) drop(id string) {
 		defer ss.mu.Unlock()
 		ss.demo.Close()
 		ss.sim.Close()
+		if ss.outage != nil {
+			ss.outage.Close()
+		}
 	}()
 }
 
@@ -146,6 +151,26 @@ func (s *Server) requireStrategyStories() error {
 	return nil
 }
 
+// newOutage creates the SQLite-failure world: revision-aware, with client
+// version tokens so a request can ask for an older revision.
+func newOutage() (*demo.Demo, error) {
+	d, err := demo.New(demo.RevisionAware)
+	if err != nil {
+		return nil, err
+	}
+	d.ClientTokens = true
+	return d, nil
+}
+
+// requireSQLiteFailure rejects requests for the SQLite-failure simulation
+// when its flag is off.
+func (s *Server) requireSQLiteFailure() error {
+	if !s.flags.SQLiteFailure {
+		return httpError{http.StatusNotFound, "the SQLite failure simulation is disabled (FEATURE_SQLITE_FAILURE=false)"}
+	}
+	return nil
+}
+
 // requireControlledDelivery rejects requests for the controlled-cache-delivery
 // feature when its flag is off.
 func (s *Server) requireControlledDelivery() error {
@@ -160,6 +185,7 @@ type world int
 const (
 	mainWorld world = iota
 	simWorld
+	outageWorld
 )
 
 func (s *Server) Routes(mux *http.ServeMux) {
@@ -194,7 +220,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			if wd == simWorld {
 				return withPair(r, (*d).Check)
 			}
-			return s.check(r, *d)
+			return s.check(r, *d, true)
 		}))
 		mux.HandleFunc("POST "+prefix+"/deliver", s.with(wd, func(r *http.Request, d **demo.Demo) (any, error) {
 			if err := s.requireControlledDelivery(); err != nil {
@@ -203,6 +229,38 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			return (*d).DeliverNext(), nil
 		}))
 	}
+
+	// The SQLite-failure simulation (FEATURE_SQLITE_FAILURE).
+	mux.HandleFunc("GET /api/v1/outage/state", s.with(outageWorld, func(r *http.Request, d **demo.Demo) (any, error) {
+		return (*d).State()
+	}))
+	mux.HandleFunc("POST /api/v1/outage/reset", s.with(outageWorld, func(r *http.Request, d **demo.Demo) (any, error) {
+		fresh, err := newOutage()
+		if err != nil {
+			return nil, err
+		}
+		(*d).Close()
+		*d = fresh
+		return fresh.State()
+	}))
+	mux.HandleFunc("POST /api/v1/outage/grant", s.with(outageWorld, func(r *http.Request, d **demo.Demo) (any, error) {
+		return withPair(r, (*d).Grant)
+	}))
+	mux.HandleFunc("POST /api/v1/outage/revoke", s.with(outageWorld, func(r *http.Request, d **demo.Demo) (any, error) {
+		return withPair(r, (*d).Revoke)
+	}))
+	mux.HandleFunc("POST /api/v1/outage/check", s.with(outageWorld, func(r *http.Request, d **demo.Demo) (any, error) {
+		return s.check(r, *d, false)
+	}))
+	mux.HandleFunc("POST /api/v1/outage/primary", s.with(outageWorld, func(r *http.Request, d **demo.Demo) (any, error) {
+		var req struct {
+			Down bool `json:"down"`
+		}
+		if err := decode(r, &req); err != nil {
+			return nil, err
+		}
+		return (*d).SetPrimaryDown(req.Down), nil
+	}))
 
 	mux.HandleFunc("POST /api/v1/strategy", s.with(mainWorld, func(r *http.Request, d **demo.Demo) (any, error) {
 		var req struct {
@@ -310,15 +368,35 @@ func (s *Server) with(wd world, h func(r *http.Request, d **demo.Demo) (any, err
 			return
 		}
 		target := &ss.demo
-		if wd == simWorld {
+		switch wd {
+		case simWorld:
 			if err := s.requireControlledDelivery(); err != nil {
 				writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 				return
 			}
 			target = &ss.sim
+		case outageWorld:
+			if err := s.requireSQLiteFailure(); err != nil {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+				return
+			}
+			if ss.outage == nil {
+				if ss.outage, err = newOutage(); err != nil {
+					writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+					return
+				}
+			}
+			target = &ss.outage
 		}
 		out, err := h(r, target)
 		if err != nil {
+			// SQLite is down and no cached snapshot can answer: 503, with the
+			// details (requested revision, snapshot revision, hops) for the UI.
+			var ue *demo.UnavailableError
+			if errors.As(err, &ue) {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": ue.Message, "unavailable": ue})
+				return
+			}
 			status := http.StatusInternalServerError
 			var he httpError
 			if errors.As(err, &he) {
@@ -348,9 +426,11 @@ func (s *Server) reset(d **demo.Demo, st demo.Strategy, main bool) (any, error) 
 	return fresh.State()
 }
 
-// check handles a main-demo check, which may carry revision-aware options:
-// the client's version token, or "consistency": "fully_consistent".
-func (s *Server) check(r *http.Request, d *demo.Demo) (any, error) {
+// check handles a check that may carry revision-aware options: the client's
+// version token, or "consistency": "fully_consistent". With gated, the
+// options need FEATURE_CLIENT_VERSION_TOKEN (main demo); the SQLite-failure
+// simulation always accepts them.
+func (s *Server) check(r *http.Request, d *demo.Demo, gated bool) (any, error) {
 	var req struct {
 		Subject     string `json:"subject"`
 		Object      string `json:"object"`
@@ -368,14 +448,23 @@ func (s *Server) check(r *http.Request, d *demo.Demo) (any, error) {
 	default:
 		return nil, badRequest(errors.New(`consistency must be "at_least_as_fresh" or "fully_consistent"`))
 	}
-	if opts != (demo.CheckOpts{}) && !s.flags.ClientVersionToken {
+	if gated && opts != (demo.CheckOpts{}) && !s.flags.ClientVersionToken {
 		return nil, httpError{http.StatusNotFound, "client version tokens are disabled (FEATURE_CLIENT_VERSION_TOKEN=false)"}
 	}
 	out, err := d.CheckWith(req.Subject, req.Object, opts)
 	if err != nil {
-		return nil, badRequest(err)
+		return nil, passUnavailable(err)
 	}
 	return out, nil
+}
+
+// passUnavailable keeps a 503 as it is and turns any other error into a 400.
+func passUnavailable(err error) error {
+	var ue *demo.UnavailableError
+	if errors.As(err, &ue) {
+		return err
+	}
+	return badRequest(err)
 }
 
 func withPair[T any](r *http.Request, f func(subject, object string) (T, error)) (any, error) {
@@ -388,7 +477,7 @@ func withPair[T any](r *http.Request, f func(subject, object string) (T, error))
 	}
 	out, err := f(req.Subject, req.Object)
 	if err != nil {
-		return nil, badRequest(err)
+		return nil, passUnavailable(err)
 	}
 	return out, nil
 }

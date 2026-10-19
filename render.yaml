@@ -18,3 +18,5 @@ services:
         value: "true"
       - key: FEATURE_CLIENT_VERSION_TOKEN
         value: "true"
+      - key: FEATURE_SQLITE_FAILURE
+        value: "true"

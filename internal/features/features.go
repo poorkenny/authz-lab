@@ -28,11 +28,15 @@ type Flags struct {
 	// show that the strategy promises "at least as fresh as the token", not
 	// "the latest".
 	ClientVersionToken bool `json:"clientVersionToken"`
+	// SQLiteFailure: a separate simulation where SQLite can be taken down. A
+	// check is still answered from a cached snapshot at least as fresh as the
+	// requested revision; otherwise the API returns 503.
+	SQLiteFailure bool `json:"sqliteFailure"`
 }
 
 // Defaults are the flag values used when no environment variable is set.
 func Defaults() Flags {
-	return Flags{ControlledCacheDelivery: true, StrategyStories: true, HappyPathComparison: true, ClientVersionToken: true}
+	return Flags{ControlledCacheDelivery: true, StrategyStories: true, HappyPathComparison: true, ClientVersionToken: true, SQLiteFailure: true}
 }
 
 // FromEnv reads flags from environment variables, falling back to Defaults
@@ -43,6 +47,7 @@ func FromEnv(getenv func(string) string) Flags {
 	f.StrategyStories = boolFlag(getenv, "FEATURE_STRATEGY_STORIES", f.StrategyStories)
 	f.HappyPathComparison = boolFlag(getenv, "FEATURE_HAPPY_PATH_COMPARISON", f.HappyPathComparison)
 	f.ClientVersionToken = boolFlag(getenv, "FEATURE_CLIENT_VERSION_TOKEN", f.ClientVersionToken)
+	f.SQLiteFailure = boolFlag(getenv, "FEATURE_SQLITE_FAILURE", f.SQLiteFailure)
 	return f
 }
 

@@ -261,3 +261,14 @@ tr.k-async td { background: var(--warn-wash); }
 /* Client version token */
 .result.warn { border-left-color: var(--warn); background: var(--warn-wash); }
 .principle { margin: 0 0 14px; padding: 10px 14px; border-radius: 8px; background: var(--surface-2); border-left: 4px solid var(--accent); font-size: 0.95em; line-height: 1.5; }
+
+/* SQLite failure simulation */
+.primary-status { font-weight: 700; padding: 2px 10px; border-radius: 999px; border: 1px solid; }
+.primary-status.up { color: var(--good-ink); border-color: var(--good); background: var(--good-wash); }
+.primary-status.down { color: var(--critical-ink); border-color: var(--critical); background: var(--critical-wash); }
+.fail-btn, button.fail-btn:hover:not(:disabled) { background: var(--critical); color: #fff; border-color: transparent; font-weight: 700; }
+.box.down rect { fill: var(--critical-wash); stroke: var(--critical); stroke-dasharray: 6 4; }
+.box-sub.down-sub { fill: var(--critical-ink); font-weight: 700; }
+.hop-label.k-fail { fill: var(--critical-ink); font-weight: 700; }
+tr.k-fail td { background: var(--critical-wash); }
+.outage-table { min-width: 760px; }

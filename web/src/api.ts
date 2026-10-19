@@ -1,4 +1,4 @@
-import type { CheckOpts, CheckResult, ClockResult, CompareRow, DeliverResult, Features, State, Strategy, SuiteResult, WriteResult } from "./types";
+import type { CheckOpts, CheckResult, ClockResult, CompareRow, DeliverResult, Features, PrimaryResult, State, Strategy, SuiteResult, WriteResult } from "./types";
 
 const SESSION_KEY = "authz-lab-session";
 let memorySession = "";
@@ -19,11 +19,13 @@ function sessionId(): string {
   }
 }
 
-// ApiError carries the HTTP status so callers can tell "busy" (409) from failures.
+// ApiError carries the HTTP status so callers can tell "busy" (409) or
+// "unavailable" (503) from failures, and the response body for details.
 export class ApiError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    readonly body: Record<string, unknown> = {},
   ) {
     super(message);
   }
@@ -36,7 +38,7 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new ApiError(data.error ?? `${res.status} ${res.statusText}`, res.status);
+  if (!res.ok) throw new ApiError(data.error ?? `${res.status} ${res.statusText}`, res.status, data);
   return data as T;
 }
 
@@ -62,5 +64,14 @@ export const api = {
   sim: {
     ...world("/api/v1/sim"),
     otherWrites: (count: number) => call<WriteResult[]>("POST", "/api/v1/sim/other-writes", { count }),
+  },
+  // The SQLite-failure simulation (FEATURE_SQLITE_FAILURE): no delivery queue.
+  outage: {
+    state: () => call<State>("GET", "/api/v1/outage/state"),
+    reset: () => call<State>("POST", "/api/v1/outage/reset"),
+    check: (subject: string, object: string, opts?: CheckOpts) => call<CheckResult>("POST", "/api/v1/outage/check", { subject, object, ...opts }),
+    grant: (subject: string, object: string) => call<WriteResult>("POST", "/api/v1/outage/grant", { subject, object }),
+    revoke: (subject: string, object: string) => call<WriteResult>("POST", "/api/v1/outage/revoke", { subject, object }),
+    setPrimary: (down: boolean) => call<PrimaryResult>("POST", "/api/v1/outage/primary", { down }),
   },
 };
