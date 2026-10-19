@@ -242,11 +242,14 @@ export default function App() {
   return (
     <div className="app">
       <header>
-        <p className="eyebrow">Authorization showcase</p>
-        <h1>Stale permissions: three strategies, three trade-offs</h1>
+        <p className="eyebrow">Distributed authorization</p>
+        <h1>RevokeLab: a platform helps determine the permission refresh strategies in distributed authorization system</h1>
         <div className="goal" role="note">
-          <strong>Goal of this demo:</strong> compare strategies for stopping a permission cache from serving <strong>stale ALLOWs</strong> after access is
-          revoked. For each one, see what it fixes, what it can't promise, and what it costs in latency. That makes it easier to choose the right trade-off.
+          <strong>Goal of the platform:</strong> help security engineers <strong>choose the permission refresh strategy that meets the business needs</strong>.
+          RevokeLab <strong>runs simulations based on your permission revocation needs</strong>: a revoked user reading again, invalidations stuck behind a
+          queue backlog, clients sending old version tokens, a SQLite outage, and randomized workloads of grants and revokes. For each strategy (TTL cache,
+          TTL + invalidation, revision-aware) it shows how long a revoked user can keep a <strong>stale ALLOW</strong>, what the strategy can and cannot
+          guarantee, and what it costs in latency. You can then pick the strategy whose trade-off fits how fast access must be revoked.
         </div>
       </header>
 
