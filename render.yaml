@@ -16,3 +16,5 @@ services:
         value: "true"
       - key: FEATURE_HAPPY_PATH_COMPARISON
         value: "true"
+      - key: FEATURE_CLIENT_VERSION_TOKEN
+        value: "true"

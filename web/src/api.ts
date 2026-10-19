@@ -1,4 +1,4 @@
-import type { CheckResult, ClockResult, CompareRow, DeliverResult, Features, State, Strategy, SuiteResult, WriteResult } from "./types";
+import type { CheckOpts, CheckResult, ClockResult, CompareRow, DeliverResult, Features, State, Strategy, SuiteResult, WriteResult } from "./types";
 
 const SESSION_KEY = "authz-lab-session";
 let memorySession = "";
@@ -45,7 +45,7 @@ function world(prefix: string) {
   return {
     state: () => call<State>("GET", `${prefix}/state`),
     reset: () => call<State>("POST", `${prefix}/reset`),
-    check: (subject: string, object: string) => call<CheckResult>("POST", `${prefix}/check`, { subject, object }),
+    check: (subject: string, object: string, opts?: CheckOpts) => call<CheckResult>("POST", `${prefix}/check`, { subject, object, ...opts }),
     grant: (subject: string, object: string) => call<WriteResult>("POST", `${prefix}/grant`, { subject, object }),
     revoke: (subject: string, object: string) => call<WriteResult>("POST", `${prefix}/revoke`, { subject, object }),
     deliver: () => call<DeliverResult>("POST", `${prefix}/deliver`),

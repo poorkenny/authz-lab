@@ -257,3 +257,7 @@ tr.k-async td { background: var(--warn-wash); }
 .happy-col.bad { border-left-color: var(--critical); }
 .happy-note { grid-column: 1 / -1; margin: 0; }
 .freshness table { min-width: 680px; }
+
+/* Client version token */
+.result.warn { border-left-color: var(--warn); background: var(--warn-wash); }
+.principle { margin: 0 0 14px; padding: 10px 14px; border-radius: 8px; background: var(--surface-2); border-left: 4px solid var(--accent); font-size: 0.95em; line-height: 1.5; }

@@ -17,7 +17,7 @@ Permission checks are cached for speed. When an admin revokes access in SQLite, 
 | | 1 · TTL cache (naive) | 2 · TTL + invalidation on write | 3 · Revision-aware fallback |
 |---|---|---|---|
 | **How** | Cache until the TTL expires; writes don't touch the cache | After each SQLite commit, an invalidation event goes onto a delivery queue; the cache drops the entry when it is delivered | Entries stamped with their revision; requests carry the doc's revision token; older entries fall back to SQLite |
-| **Stale window** | Up to the full TTL (5 min here) | From the commit until the event is delivered, including any backlog ahead of it | **None** |
+| **Stale window** | Up to the full TTL (5 min here) | From the commit until the event is delivered, including any backlog ahead of it | **None** relative to the request's token (at least as fresh as the token, not necessarily the latest) |
 | **Read latency** | 1.2 ms hit · 16.3 ms miss | 1.2 ms hit · 16.3 ms miss after a delivery | 1.21 ms hit · 16.31 ms fallback, once per change |
 | **Write cost** | None | Enqueue an invalidation event per write (0.3 ms) | Bump the doc's token in the same SQLite transaction |
 | **Needs** | Nothing | A delivery queue / pub-sub to every cache node | Revision tokens propagated with requests (like Zanzibar zookies) |
@@ -55,6 +55,26 @@ The page also runs the story for all three strategies side by side:
 | TTL + invalidation | ✕ ALLOW (cache, 1.2 ms) | ✓ DENY (SQLite, 16.3 ms) | stale until the event is delivered |
 | Revision-aware | ✓ DENY (SQLite fallback, 16.3 ms) | ✓ DENY (cache, 1.2 ms) | always fresh |
 
+## Version tokens: at least as fresh, not the latest
+
+The revision-aware strategy makes one promise: **a check is evaluated at a version at least as new as the token in the request.** It does not promise the latest version. When the version token feature is on (flag `FEATURE_CLIENT_VERSION_TOKEN`), the revision-aware story shows this:
+
+1. **Alice opens doc:42**: ALLOW is cached at rev 3, and her client keeps doc:42's token, ver#3, with the document.
+2. **Admin revokes Alice**: doc:42 moves to ver#4. Alice's client still holds ver#3.
+3. **Check with her old token ver#3** (repeatable): the cached entry (rev 3) is not older than the token, so it is served. The result is ALLOW, **not the latest**, while the promise (rev 3 ≥ ver#3) is kept.
+4. **Check with the latest token**: the entry is older than ver#4, so the check falls back to SQLite and answers DENY.
+5. **Fully consistent check**: skips the cache and asks SQLite at its latest revision. DENY, **always the latest**, at 16.0 ms on every check.
+
+| Request | Decision | Served by | Latency | Promise |
+|---|---|---|---|---|
+| Old token ver#3 | ALLOW (not the latest) | cache | 1.2 ms | ✓ evaluated at rev 3 ≥ ver#3 |
+| Latest token ver#4 | DENY | SQLite (fallback, then cached) | 16.3 ms | ✓ evaluated at rev 4 ≥ ver#4 |
+| Fully consistent | DENY | SQLite, every time | 16.0 ms | latest, but no cache offload |
+
+Getting the latest decision every time requires strong consistency: every check goes to the single source of truth. That gives up the scalability the cache provides. On the property-test workloads, fully consistent checks are never wrong, but the cache hit rate is 0% and every check costs about 16 ms, against a mean of 4.5 ms for revision-aware.
+
+"Explore freely" has a **request token** selector (latest, any ver#N, or fully consistent) for revision-aware checks.
+
 ## Simulation: read-after-write inconsistency in the invalidation queue
 
 A separate world (always the invalidation strategy) where you control the delivery queue directly: Alice reads, admin revokes / re-grants Alice, unrelated writes (+1 / +3) that queue their own events, and **Deliver next invalidation**, one event at a time in FIFO order. Every read records where Alice's invalidation sat in the queue at that moment.
@@ -87,7 +107,11 @@ A separate world (always the invalidation strategy) where you control the delive
 | A queue backlog stretches the inconsistency | Invalidation | stale through 3 deliveries, fresh only after her own |
 | Revision-aware is correct before any delivery | Revision-aware | no invalidation needed |
 | Revision-aware pays the fallback once, then hits the cache again | Revision-aware | the cost is bounded |
-| Revision-aware decisions always match SQLite | property | 30 seeds × 400 random ops: **0 wrong** |
+| An old token in the request can still read a result that is not the latest | Revision-aware | the promise is "at least as fresh as the token", not "the latest" |
+| The latest token makes the same check fresh | Revision-aware | fallback to SQLite, DENY |
+| Fully consistent: always the latest, never from the cache | Revision-aware | strong consistency skips the cache |
+| Revision-aware decisions always match SQLite | property | 30 seeds × 400 random ops, each check with the doc's latest token: **0 wrong** |
+| Fully consistent reads are always correct, but never use the cache | property | 0 wrong, 0% cache hits, every check on SQLite |
 | Invalidation mitigates, but cannot eliminate, stale decisions | property | far fewer mistakes than TTL, every one while the user's event was queued |
 | The same workloads catch the TTL cache | property | the property test can actually fail |
 
@@ -112,6 +136,7 @@ Every feature ships behind a flag; see **[docs/FEATURES.md](docs/FEATURES.md)** 
 | `FEATURE_CONTROLLED_CACHE_DELIVERY` | `true` | Invalidation events wait in the queue until delivered from the UI (deliver step, queue button, section 3 simulation). Off: delivered automatically after each commit. |
 | `FEATURE_STRATEGY_STORIES` | `true` | Each strategy gets its own story. TTL: no delivery step; entries expire on a simulated clock, with a TTL and freshness panel and a fast-forward step. Off: one shared story for all strategies. |
 | `FEATURE_HAPPY_PATH_COMPARISON` | `true` | An invalidation read made while its event is queued also returns the happy-path result, shown side by side. Off: only the read's own result. |
+| `FEATURE_CLIENT_VERSION_TOKEN` | `true` | A revision-aware check can carry the client's own (possibly old) version token, or ask for a fully consistent read; the revision-aware story shows "at least as fresh as the token, not the latest". Off: checks always use the doc's latest token. |
 | `FEATURE_AUTH` | `false` | *Planned*: authentication and user management (see [TODO.md](TODO.md)). |
 
 ## Run locally
@@ -134,7 +159,7 @@ All endpoints accept an `X-Lab-Session` header. Each session has two worlds, eac
 | `GET /api/v1/features` | active feature flags (see [docs/FEATURES.md](docs/FEATURES.md)) |
 | `GET /api/v1/state` | strategy, SQLite revision, tuples, revision tokens, cache entries (with age and time left), TTL config, simulated clock, queued + recently delivered invalidations |
 | `POST /api/v1/strategy {strategy: "ttl" \| "invalidation" \| "revision_aware"}` | switch strategy (starts a fresh world) |
-| `POST /api/v1/check {subject, object}` | check `view`. Returns decision, SQLite's answer, served-by, revisions, the user's queued invalidation (position in queue), the entry's age, **hops with per-hop latency** and, while the invalidation is queued, the `happyPath` result (flag `FEATURE_HAPPY_PATH_COMPARISON`) |
+| `POST /api/v1/check {subject, object, token?, consistency?}` | check `view`. Returns decision, SQLite's answer, served-by, revisions, the user's queued invalidation (position in queue), the entry's age, **hops with per-hop latency** and, while the invalidation is queued, the `happyPath` result (flag `FEATURE_HAPPY_PATH_COMPARISON`). Revision-aware only: `token` is the client's version token (default: the doc's latest), `consistency: "fully_consistent"` skips the cache; the response adds `tokenSource`, `latestToken`, `evaluatedRev`, `contractMet` (flag `FEATURE_CLIENT_VERSION_TOKEN`) |
 | `POST /api/v1/grant` · `POST /api/v1/revoke {subject, object}` | change access in SQLite (queues an invalidation event under the invalidation strategy) |
 | `POST /api/v1/deliver` | deliver the invalidation event at the head of the queue (flag `FEATURE_CONTROLLED_CACHE_DELIVERY`) |
 | `POST /api/v1/clock/advance {seconds}` | fast-forward the simulated clock 1–3600 s; entries that reach the TTL are evicted (flag `FEATURE_STRATEGY_STORIES`) |

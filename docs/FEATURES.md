@@ -17,6 +17,7 @@ Every feature of the demo ships behind a **feature flag**, so it can be released
 | [`FEATURE_CONTROLLED_CACHE_DELIVERY`](#feature_controlled_cache_delivery) | `true` (enabled) | Released | PR #4 |
 | [`FEATURE_STRATEGY_STORIES`](#feature_strategy_stories) | `true` (enabled) | Released | PR #7 |
 | [`FEATURE_HAPPY_PATH_COMPARISON`](#feature_happy_path_comparison) | `true` (enabled) | Released | PR #7 |
+| [`FEATURE_CLIENT_VERSION_TOKEN`](#feature_client_version_token) | `true` (enabled) | Released | PR #9 |
 | `FEATURE_AUTH` | `false` | Planned: authentication and user management (see [TODO.md](../TODO.md)) | not implemented |
 
 ## How to enable / disable a flag
@@ -35,7 +36,7 @@ Check what a running instance uses:
 
 ```bash
 curl -s https://<your-service>.onrender.com/api/v1/features
-# {"controlledCacheDelivery":true,"strategyStories":true,"happyPathComparison":true}
+# {"controlledCacheDelivery":true,"strategyStories":true,"happyPathComparison":true,"clientVersionToken":true}
 ```
 
 ---
@@ -114,3 +115,30 @@ The happy path is computed without changing any state: the queue, the cache and 
 | Date | Change |
 |---|---|
 | 2026-10-18 | Introduced, enabled by default (PR #7) |
+
+---
+
+## `FEATURE_CLIENT_VERSION_TOKEN`
+
+**Client version token**: a revision-aware check can carry the client's own version token, which may be older than the document's latest, or ask for a fully consistent read. This shows the design principle of the revision-aware strategy: a check is evaluated at a version **at least as new as the token in the request**, not necessarily the latest. Only a fully consistent read, which skips the cache and asks the single source of truth every time, promises the latest. That is strong consistency without scalability.
+
+- **Default:** `true` (enabled)
+- **Code:** `internal/features` (flag), `internal/demo` (`Options.ClientTokens`, `CheckOpts`, `Demo.CheckWith`), `internal/api` (`check` handler), `web/src/App.tsx` (revision-aware story, design-principle note, request-token selector)
+
+| | Enabled (`true`) | Disabled (`false`) |
+|---|---|---|
+| `POST /api/v1/check` | Accepts `token` (client's version token) and `consistency: "fully_consistent"` for the revision-aware strategy; returns `tokenSource`, `latestToken`, `evaluatedRev`, `contractMet` | Requests with `token` or `consistency` return `404`; checks always use the doc's latest token |
+| Revision-aware story (with `FEATURE_STRATEGY_STORIES`) | open doc (client keeps ver#3) → revoke (ver#4) → **check with the old token** (cached ALLOW: promise kept, not the latest) → check with the latest token (DENY) → **fully consistent check** (DENY, always SQLite) | read → revoke → read after the revoke (fallback) → read again (cache hit) |
+| Design-principle note | Shown above the revision-aware steps | Hidden |
+| Result card | Old-token reads show "✓ promise kept: evaluated at rev N ≥ request token ver#M" and "✕ not the latest" | Not applicable |
+| Latency budget | Includes "Fully consistent read (always SQLite): 16.0 ms" | Row hidden |
+| Explore freely | Request-token selector: latest, ver#N, or fully consistent | No selector |
+| `GET /api/v1/features` | `"clientVersionToken":true` | `"clientVersionToken":false` |
+
+A token newer than the latest committed revision is rejected with `400`, and so is a token or consistency mode sent with the TTL or invalidation strategy. The correctness suite covers the old-token, latest-token and fully consistent cases and runs a fully consistent property test on the shared workloads, whatever the flag says.
+
+### Release history
+
+| Date | Change |
+|---|---|
+| 2026-10-18 | Introduced, enabled by default (PR #9) |

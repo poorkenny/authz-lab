@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "./api";
-import type { CheckResult, ClockResult, CompareRow, DeliverResult, Features, Hop, State, Strategy, WriteResult } from "./types";
+import type { CheckOpts, CheckResult, ClockResult, CompareRow, DeliverResult, Features, Hop, State, Strategy, WriteResult } from "./types";
 import { CacheFreshness } from "./components/CacheFreshness";
 import { FlowDiagram, fmtMs, hopMs, shortLabel } from "./components/FlowDiagram";
 import { QueueSimulation } from "./components/QueueSimulation";
@@ -10,7 +10,9 @@ import { STRATEGIES, byId } from "./strategies";
 type Entry = { kind: "check"; r: CheckResult } | { kind: "write"; r: WriteResult } | { kind: "deliver"; r: DeliverResult } | { kind: "clock"; r: ClockResult };
 
 interface Actions {
-  check: (subject: string, object: string) => Promise<boolean>;
+  check: (subject: string, object: string, opts?: CheckOpts) => Promise<boolean>;
+  // open is a check after which the client keeps the document's version token.
+  open: (subject: string, object: string) => Promise<boolean>;
   write: (op: "grant" | "revoke", subject: string, object: string) => Promise<boolean>;
   deliver: () => Promise<boolean>;
   advance: (seconds: number) => Promise<boolean>;
@@ -45,7 +47,15 @@ const AUTO_STEPS: StepDef[] = [
 // steps that make sense for it. TTL sends no invalidations, so instead of a
 // delivery step the clock is fast-forwarded past the TTL.
 const TTL_SEC = 300;
-const STORIES: Record<Strategy, (controlled: boolean) => StepDef[]> = {
+// With FEATURE_CLIENT_VERSION_TOKEN the revision-aware story shows that the
+// strategy promises "at least as fresh as the token in the request", not "the
+// latest": an old token can still read an old result.
+interface StoryCtx {
+  controlled: boolean;
+  tokens: boolean;
+  held: number; // version token Alice's client kept when it opened the doc
+}
+const STORIES: Record<Strategy, (c: StoryCtx) => StepDef[]> = {
   ttl: () => [
     { title: "Alice opens doc:42", hint: `Cache miss → SQLite → ALLOW is cached with a ${TTL_SEC} s TTL.`, run: (a) => a.check("user:alice", "doc:42") },
     { title: "Admin revokes Alice", hint: "SQLite commits the revoke. Nothing tells the cache.", run: (a) => a.write("revoke", "user:alice", "doc:42") },
@@ -53,7 +63,7 @@ const STORIES: Record<Strategy, (controlled: boolean) => StepDef[]> = {
     { title: `Fast-forward ${TTL_SEC} s`, hint: "Skip the simulated clock to the end of the TTL.", run: (a) => a.advance(TTL_SEC) },
     { title: "Alice reads after the TTL", hint: "The entry expired, so SQLite answers.", run: (a) => a.check("user:alice", "doc:42") },
   ],
-  invalidation: (controlled) =>
+  invalidation: ({ controlled }) =>
     controlled
       ? [
           { title: "Alice opens doc:42", hint: "Cache miss → SQLite → ALLOW is cached.", run: (a) => a.check("user:alice", "doc:42") },
@@ -69,7 +79,33 @@ const STORIES: Record<Strategy, (controlled: boolean) => StepDef[]> = {
           { title: "Alice reads after delivery", hint: "The entry is gone, so SQLite answers.", run: (a) => a.check("user:alice", "doc:42") },
         ]
       : AUTO_STEPS,
-  revision_aware: () => [
+  revision_aware: ({ tokens, held }) =>
+    tokens
+      ? [
+          {
+            title: "Alice opens doc:42",
+            hint: "Cache miss → SQLite → ALLOW cached at rev 3. Her client keeps doc:42's version token with the document.",
+            run: (a) => a.open("user:alice", "doc:42"),
+          },
+          {
+            title: "Admin revokes Alice",
+            hint: `doc:42 moves to a newer version; Alice's client still holds ver#${held || "?"}.`,
+            run: (a) => a.write("revoke", "user:alice", "doc:42"),
+          },
+          {
+            title: `Check with her old token ver#${held || "?"}`,
+            hint: "The cached entry is not older than the token, so it is served: promise kept, but not the latest.",
+            run: (a) => a.check("user:alice", "doc:42", { token: held }),
+            repeatable: true,
+          },
+          { title: "Check with the latest token", hint: "The entry is older than doc:42's latest version: fallback to SQLite.", run: (a) => a.check("user:alice", "doc:42") },
+          {
+            title: "Fully consistent check",
+            hint: "Skip the cache and ask SQLite: always the latest, always the slow path.",
+            run: (a) => a.check("user:alice", "doc:42", { consistency: "fully_consistent" }),
+          },
+        ]
+      : [
     { title: "Alice opens doc:42", hint: "Cache miss → SQLite → ALLOW is cached, stamped with its revision.", run: (a) => a.check("user:alice", "doc:42") },
     { title: "Admin revokes Alice", hint: "SQLite commits the revoke; doc:42's revision token moves forward.", run: (a) => a.write("revoke", "user:alice", "doc:42") },
     { title: "Alice reads after the revoke", hint: "The entry is older than the token: fallback to SQLite.", run: (a) => a.check("user:alice", "doc:42") },
@@ -83,17 +119,21 @@ const PATHS = [
   { id: "ra-hit", name: "Revision-aware hit (entry fresh)", hops: "+ revision check 0.01", ms: "1.21 ms" },
   { id: "miss", name: "Cache miss → SQLite (incl. after a delivery)", hops: "+ SQLite query 15 + cache refresh 0.1", ms: "16.3 ms" },
   { id: "ra-fallback", name: "Revision-aware fallback (entry stale)", hops: "+ revision check + SQLite 15 + refresh", ms: "16.31 ms" },
+  { id: "strong", name: "Fully consistent read (always SQLite)", hops: "request 0.5 + SQLite 15 + response 0.5; no cache", ms: "16.0 ms" },
   { id: "write", name: "Write: SQLite commit (+ enqueue)", hops: "commit 15 + enqueue 0.3; delivery is a separate, later event", ms: "15.3 ms" },
 ];
 
 function pathOf(r: CheckResult): string {
+  if (r.consistency === "fully_consistent") return "strong";
   if (r.servedBy === "cache") return r.strategy === "revision_aware" ? "ra-hit" : "hit";
   return r.cacheRev > 0 && r.strategy === "revision_aware" ? "ra-fallback" : "miss";
 }
 
 export default function App() {
   const [state, setState] = useState<State | null>(null);
-  const [flags, setFlags] = useState<Features>({ controlledCacheDelivery: true, strategyStories: true, happyPathComparison: true });
+  const [flags, setFlags] = useState<Features>({ controlledCacheDelivery: true, strategyStories: true, happyPathComparison: true, clientVersionToken: true });
+  const [held, setHeld] = useState(0);
+  const [reqToken, setReqToken] = useState("latest");
   const [step, setStep] = useState(0);
   const [log, setLog] = useState<Entry[]>([]);
   const [hops, setHops] = useState<Hop[]>([]);
@@ -137,12 +177,20 @@ export default function App() {
 
   const push = (e: Entry) => setLog((l) => [e, ...l].slice(0, 12));
   const actions: Actions = {
-    check: (subject, object) =>
+    check: (subject, object, opts) =>
+      act(async () => {
+        const r = await api.check(subject, object, opts);
+        push({ kind: "check", r });
+        setHops(r.hops ?? []);
+        setActor(`Client (${subject.replace("user:", "")})`);
+      }),
+    open: (subject, object) =>
       act(async () => {
         const r = await api.check(subject, object);
         push({ kind: "check", r });
         setHops(r.hops ?? []);
         setActor(`Client (${subject.replace("user:", "")})`);
+        setHeld(r.latestToken ?? 0);
       }),
     write: (op, subject, object) =>
       act(async () => {
@@ -167,7 +215,8 @@ export default function App() {
   const controlled = flags.controlledCacheDelivery;
   const stories = flags.strategyStories;
   const strategy = state?.strategy ?? "ttl";
-  const STEPS = stories ? STORIES[strategy](controlled) : controlled ? CONTROLLED_STEPS : AUTO_STEPS;
+  const tokens = flags.clientVersionToken && strategy === "revision_aware";
+  const STEPS = stories ? STORIES[strategy]({ controlled, tokens, held }) : controlled ? CONTROLLED_STEPS : AUTO_STEPS;
   // Manual delivery only makes sense for the strategy that has a queue.
   const canDeliver = controlled && (!stories || strategy === "invalidation");
 
@@ -257,6 +306,15 @@ export default function App() {
           </button>
         </div>
 
+        {tokens && (
+          <div className="principle" role="note">
+            <strong>Design principle of the revision-aware strategy.</strong> A check is evaluated at a version <em>at least as new as the token in the
+            request</em>. It does <em>not</em> promise the latest version: a client that sends an old token can still get an old (but consistent) answer. Only a{" "}
+            <strong>fully consistent</strong> read promises the latest, by skipping the cache and asking the single source of truth on every check. That is
+            strong consistency without scalability: no cache offload, the full primary round trip every time.
+          </div>
+        )}
+
         <ol className="steps">
           {STEPS.map((s, i) => {
             const open = i === step || (s.repeatable && step === i + 1);
@@ -285,19 +343,32 @@ export default function App() {
         {lastEntry && (
           <div className="result-row">
             {lastEntry.kind === "check" ? (
-              <div className={`result ${lastEntry.r.correct ? "ok" : "bad"}`} aria-live="polite">
+              <div className={`result ${lastEntry.r.correct ? "ok" : lastEntry.r.tokenSource === "client" && lastEntry.r.contractMet ? "warn" : "bad"}`} aria-live="polite">
                 <div className="decision">
                   {lastEntry.r.subject.replace("user:", "")} → {lastEntry.r.object}: <strong>{lastEntry.r.decision}</strong>
                   <span className={`badge ${lastEntry.r.correct ? "ok" : "bad"}`}>
-                    {lastEntry.r.correct ? "✓ fresh" : `✕ stale: SQLite says ${lastEntry.r.expected}`}
+                    {lastEntry.r.correct ? (lastEntry.r.consistency === "fully_consistent" ? "✓ latest" : "✓ fresh") : lastEntry.r.tokenSource === "client" ? `✕ not the latest: ${lastEntry.r.object} is at ver#${lastEntry.r.latestToken}, SQLite says ${lastEntry.r.expected}` : `✕ stale: SQLite says ${lastEntry.r.expected}`}
                   </span>
+                  {flags.clientVersionToken && lastEntry.r.tokenSource === "client" && lastEntry.r.contractMet && (
+                    <span className="badge ok">
+                      ✓ promise kept: evaluated at rev {lastEntry.r.evaluatedRev} ≥ request token ver#{lastEntry.r.requiredRev}
+                    </span>
+                  )}
+                  {lastEntry.r.consistency === "fully_consistent" && <span className="badge warn">fully consistent: cache skipped</span>}
                   {lastEntry.r.pending && <span className="badge warn">invalidation #{lastEntry.r.pending.id} still queued</span>}
                 </div>
                 <p>{lastEntry.r.reason}</p>
                 <p className="mono small">
                   served by {lastEntry.r.servedBy} · cache entry rev {lastEntry.r.cacheRev || "—"}
                   {stories && lastEntry.r.servedBy === "cache" && <> (age {Math.floor(lastEntry.r.entryAgeSec)} s of {lastEntry.r.ttlSec} s TTL)</>} · doc version token{" "}
-                  {lastEntry.r.requiredRev ? `${lastEntry.r.object} ver#${lastEntry.r.requiredRev}` : "not used"} · SQLite rev {lastEntry.r.primaryRev} · {fmtMs(lastEntry.r.latencyMs)} ms
+                  {lastEntry.r.tokenSource === "client"
+                    ? `from the request ver#${lastEntry.r.requiredRev} (latest ${lastEntry.r.object} ver#${lastEntry.r.latestToken})`
+                    : lastEntry.r.consistency === "fully_consistent"
+                      ? "not used (fully consistent)"
+                      : lastEntry.r.requiredRev
+                        ? `${lastEntry.r.object} ver#${lastEntry.r.requiredRev}`
+                        : "not used"}{" "}
+                  · SQLite rev {lastEntry.r.primaryRev} · {fmtMs(lastEntry.r.latencyMs)} ms
                 </p>
                 {lastEntry.r.happyPath && <HappyPathCompare r={lastEntry.r} />}
               </div>
@@ -359,7 +430,7 @@ export default function App() {
             <h3>Latency budget per path</h3>
             <table className="data">
               <tbody>
-                {PATHS.map((p) => {
+                {PATHS.filter((p) => p.id !== "strong" || flags.clientVersionToken).map((p) => {
                   const current = lastEntry ? (lastEntry.kind === "write" ? p.id === "write" : lastCheck && pathOf(lastCheck) === p.id) : false;
                   return (
                     <tr key={p.id} className={current ? "current" : ""}>
@@ -422,7 +493,23 @@ export default function App() {
               <option value="doc:42">doc:42</option>
               <option value="doc:7">doc:7</option>
             </select>
-            <button disabled={busy} onClick={() => actions.check(user, doc)}>
+            {tokens && state && (
+              <select value={reqToken} onChange={(e) => setReqToken(e.target.value)} aria-label="Version token in the request">
+                <option value="latest">token: latest (doc's current version)</option>
+                {Array.from({ length: state.primaryRev }, (_, i) => i + 1).map((v) => (
+                  <option key={v} value={String(v)}>
+                    token: ver#{v}
+                  </option>
+                ))}
+                <option value="strong">fully consistent (no token)</option>
+              </select>
+            )}
+            <button
+              disabled={busy}
+              onClick={() =>
+                actions.check(user, doc, !tokens || reqToken === "latest" ? undefined : reqToken === "strong" ? { consistency: "fully_consistent" } : { token: Number(reqToken) })
+              }
+            >
               Check view
             </button>
             <button disabled={busy} onClick={() => actions.write("grant", user, doc)}>

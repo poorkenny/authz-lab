@@ -43,11 +43,11 @@ export const STRATEGIES: StrategyInfo[] = [
     name: "Revision-aware fallback",
     short: "Revision-aware",
     how: "Entries are stamped with the revision they were computed at; requests carry the doc's revision token; older entries fall back to SQLite.",
-    window: "None",
+    window: "None relative to the token in the request (an old token can read an old result)",
     read: "1.21 ms hit · 16.31 ms fallback, once per change",
     write: "Bump the doc's token in the same SQLite transaction",
     needs: "Revision tokens propagated with requests (like Zanzibar zookies)",
-    guarantee: "Every decision reflects at least the doc's latest ACL change",
+    guarantee: "Every decision is at least as fresh as the request's token; the latest token gives the latest ACL change",
     verdict: "ok",
   },
 ];
