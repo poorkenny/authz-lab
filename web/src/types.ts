@@ -167,7 +167,8 @@ export interface StrategyStats {
   inWindow: number;
   cacheHits: number;
   fallbacks: number;
-  meanMs: number;
+  p50Ms: number;
+  p99Ms: number;
   hitRatePct: number;
 }
 
