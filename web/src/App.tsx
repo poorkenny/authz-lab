@@ -244,6 +244,9 @@ export default function App() {
       <header>
         <p className="eyebrow">Distributed authorization</p>
         <h1>RevokeLab: a platform helps determine the permission refresh strategies in distributed authorization system</h1>
+        <p className="slogan">
+          A complex system with strong consistency is <strong>NOT</strong> always the right answer.
+        </p>
         <div className="goal" role="note">
           <strong>Goal of the platform:</strong> help security engineers <strong>choose the permission refresh strategy that meets the business needs</strong>.
           RevokeLab <strong>runs simulations based on your permission revocation needs</strong>: a revoked user reading again, invalidations stuck behind a
