@@ -140,18 +140,25 @@ func New(strategy Strategy) (*Demo, error) {
 	if err != nil {
 		return nil, err
 	}
-	st := d.Store
+	if err := seed(d.Store); err != nil {
+		d.Store.Close()
+		return nil, err
+	}
+	return d, nil
+}
+
+// seed writes the starting tuples (revs 1-3).
+func seed(st *store.Store) error {
 	for _, t := range []store.Tuple{
 		{Object: "doc:42", Relation: "owner", Subject: "user:bob"},
 		{Object: "doc:7", Relation: "owner", Subject: "user:bob"},
 		{Object: "doc:42", Relation: "viewer", Subject: "user:alice"},
 	} {
 		if _, err := st.Write(store.OpTouch, t); err != nil {
-			st.Close()
-			return nil, err
+			return err
 		}
 	}
-	return d, nil
+	return nil
 }
 
 // newEmpty returns a world with an empty store (used to replay logs).

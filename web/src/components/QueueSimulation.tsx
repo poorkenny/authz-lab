@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { CheckResult, QueueMsg, State } from "../types";
 import { fmtMs } from "./FlowDiagram";
+import { PoolsSimulation } from "./PoolsSimulation";
 
 const ALICE = "user:alice";
 const DOC = "doc:42";
@@ -13,7 +14,40 @@ interface Read {
   r: CheckResult;
 }
 
-export function QueueSimulation() {
+// QueueSimulation is section 3: the single invalidation queue and, with
+// FEATURE_MULTI_POOL_INVALIDATION, several instances with their own pools.
+export function QueueSimulation({ multiPool }: { multiPool: boolean }) {
+  const [tab, setTab] = useState<"single" | "pools">("single");
+  return (
+    <section className="card" aria-labelledby="sim-h">
+      <h2 id="sim-h">
+        3 · Simulation: {multiPool ? "read-after-write, out-of-order and racing invalidations" : "read-after-write inconsistency in the invalidation queue"}
+      </h2>
+      {multiPool && (
+        <div className="mode-row">
+          <div className="segmented" role="radiogroup" aria-label="Invalidation topology">
+            <button role="radio" aria-checked={tab === "single"} className={tab === "single" ? "on" : ""} onClick={() => setTab("single")}>
+              One queue
+            </button>
+            <button role="radio" aria-checked={tab === "pools"} className={tab === "pools" ? "on" : ""} onClick={() => setTab("pools")}>
+              Multiple instances and pools
+            </button>
+          </div>
+        </div>
+      )}
+      <div hidden={multiPool && tab !== "single"}>
+        <SingleQueue />
+      </div>
+      {multiPool && (
+        <div hidden={tab !== "pools"}>
+          <PoolsSimulation />
+        </div>
+      )}
+    </section>
+  );
+}
+
+function SingleQueue() {
   const [state, setState] = useState<State | null>(null);
   const [reads, setReads] = useState<Read[]>([]);
   const [note, setNote] = useState("");
@@ -22,7 +56,10 @@ export function QueueSimulation() {
   const [error, setError] = useState("");
 
   useEffect(() => {
-    api.sim.state().then(setState).catch((e: Error) => setError(e.message));
+    api.sim
+      .state()
+      .then(setState)
+      .catch((e: Error) => setError(e.message));
   }, []);
 
   async function act(f: () => Promise<string | void>) {
@@ -85,11 +122,10 @@ export function QueueSimulation() {
   const stale = reads.filter((x) => !x.r.correct).length;
 
   return (
-    <section className="card" aria-labelledby="sim-h">
-      <h2 id="sim-h">3 · Simulation: read-after-write inconsistency in the invalidation queue</h2>
+    <>
       <p>
-        Invalidation events wait in the queue until <strong>you</strong> deliver them, one at a time, in order. Read as Alice at any point to see what the
-        cache answers.
+        Invalidation events wait in the queue until <strong>you</strong> deliver them, one at a time, in order. Read as Alice at any point to see what the cache
+        answers.
       </p>
 
       <div className="sim-controls">
@@ -127,9 +163,7 @@ export function QueueSimulation() {
         <div className="stage-box">
           <div className="stage-title">SQLite (source of truth)</div>
           <div className="mono small">rev {state?.primaryRev ?? 0}</div>
-          <div className={aliceCanView ? "txt-ok" : "txt-bad"}>
-            Alice {aliceCanView ? "can" : "cannot"} view doc:42
-          </div>
+          <div className={aliceCanView ? "txt-ok" : "txt-bad"}>Alice {aliceCanView ? "can" : "cannot"} view doc:42</div>
         </div>
         <div className="arrow" aria-hidden="true">
           →
@@ -167,8 +201,7 @@ export function QueueSimulation() {
             <div className="muted">no entry for alice→doc:42</div>
           )}
           <div className="delivered">
-            <span className="muted small">delivered:</span>{" "}
-            {delivered.length === 0 && <span className="muted small">none yet</span>}
+            <span className="muted small">delivered:</span> {delivered.length === 0 && <span className="muted small">none yet</span>}
             {delivered.map((m) => (
               <span key={m.id} className={`dchip ${isAlice(m) ? "alice" : ""} ${flash === m.id ? "flash" : ""}`}>
                 #{m.id}
@@ -202,7 +235,9 @@ export function QueueSimulation() {
                 <th scope="col">SQLite says</th>
                 <th scope="col">Alice's invalidation at that moment</th>
                 <th scope="col">served by</th>
-                <th scope="col" className="num">latency</th>
+                <th scope="col" className="num">
+                  latency
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -226,6 +261,6 @@ export function QueueSimulation() {
           </table>
         </div>
       )}
-    </section>
+    </>
   );
 }

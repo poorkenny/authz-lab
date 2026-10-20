@@ -132,7 +132,7 @@ function pathOf(r: CheckResult): string {
 
 export default function App() {
   const [state, setState] = useState<State | null>(null);
-  const [flags, setFlags] = useState<Features>({ controlledCacheDelivery: true, strategyStories: true, happyPathComparison: true, clientVersionToken: true, sqliteFailure: true, logReplay: true });
+  const [flags, setFlags] = useState<Features>({ controlledCacheDelivery: true, strategyStories: true, happyPathComparison: true, clientVersionToken: true, sqliteFailure: true, logReplay: true, multiPoolInvalidation: true });
   const [held, setHeld] = useState(0);
   const [reqToken, setReqToken] = useState("latest");
   const [step, setStep] = useState(0);
@@ -567,7 +567,7 @@ export default function App() {
         </details>
       </section>
 
-      {controlled && <QueueSimulation />}
+      {controlled && <QueueSimulation multiPool={flags.multiPoolInvalidation} />}
 
       {flags.sqliteFailure && <OutageSimulation section={controlled ? 4 : 3} />}
 

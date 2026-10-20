@@ -264,3 +264,35 @@ func TestLogReplayFlag(t *testing.T) {
 		t.Errorf("%d-byte log: %d %v", len(body), code, r["error"])
 	}
 }
+
+func TestMultiPoolFlag(t *testing.T) {
+	off := serve(t, features.Flags{ControlledCacheDelivery: true, MultiPoolInvalidation: false})
+	if code, _ := call(t, off, "GET", "/api/v1/pools/state", ""); code != http.StatusNotFound {
+		t.Errorf("flag off: state = %d, want 404", code)
+	}
+
+	on := serve(t, features.Flags{ControlledCacheDelivery: true, MultiPoolInvalidation: true})
+	if code, s := call(t, on, "GET", "/api/v1/pools/state", ""); code != http.StatusOK || s["mode"] != "refresh" {
+		t.Fatalf("state: %d %v", code, s)
+	}
+	// Carol is granted through instance A while it stalls, revoked through B.
+	call(t, on, "POST", "/api/v1/pools/grant", `{"subject":"user:carol","object":"doc:42","instance":0}`)
+	call(t, on, "POST", "/api/v1/pools/pick", `{"pool":0}`)
+	call(t, on, "POST", "/api/v1/pools/revoke", `{"subject":"user:carol","object":"doc:42","instance":1}`)
+	call(t, on, "POST", "/api/v1/pools/deliver", `{"pool":1}`)
+	if code, d := call(t, on, "POST", "/api/v1/pools/deliver", `{"pool":0}`); code != http.StatusOK || d["apply"].(map[string]any)["stale"] != true {
+		t.Fatalf("resumed stale refresh: %d %v", code, d)
+	}
+	if _, r := call(t, on, "POST", "/api/v1/pools/check", `{"subject":"user:carol","object":"doc:42"}`); r["decision"] != "ALLOW" || r["stuck"] != true {
+		t.Errorf("check after the race: %v", r)
+	}
+	if code, _ := call(t, on, "POST", "/api/v1/pools/reset", `{"mode":"upsert","routing":"instance"}`); code != http.StatusBadRequest {
+		t.Errorf("bad mode = %d, want 400", code)
+	}
+	if code, s := call(t, on, "POST", "/api/v1/pools/reset", `{"mode":"fenced","routing":"document"}`); code != http.StatusOK || s["routing"] != "document" {
+		t.Errorf("reset: %d %v", code, s)
+	}
+	if code, _ := call(t, on, "POST", "/api/v1/pools/deliver", `{"pool":5}`); code != http.StatusBadRequest {
+		t.Errorf("bad pool = %d, want 400", code)
+	}
+}
