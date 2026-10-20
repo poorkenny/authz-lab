@@ -19,6 +19,7 @@ Every feature of the demo ships behind a **feature flag**, so it can be released
 | [`FEATURE_HAPPY_PATH_COMPARISON`](#feature_happy_path_comparison) | `true` (enabled) | Released | PR #7 |
 | [`FEATURE_CLIENT_VERSION_TOKEN`](#feature_client_version_token) | `true` (enabled) | Released | PR #9 |
 | [`FEATURE_SQLITE_FAILURE`](#feature_sqlite_failure) | `true` (enabled) | Released | PR #10 |
+| [`FEATURE_LOG_REPLAY`](#feature_log_replay) | `true` (enabled) | Released | PR #13 |
 | `FEATURE_AUTH` | `false` | Planned: authentication and user management (see [TODO.md](../TODO.md)) | not implemented |
 
 ## How to enable / disable a flag
@@ -59,7 +60,7 @@ curl -s https://<your-service>.onrender.com/api/v1/features
 | API | `POST /api/v1/deliver` and `/api/v1/sim/*` available | Those endpoints return `404` |
 | `GET /api/v1/features` | `{"controlledCacheDelivery":true}` | `{"controlledCacheDelivery":false}` |
 
-The correctness suite (`go test ./internal/demo` and the UI's **Run correctness tests**) always covers both behaviours, whatever the flag says. `internal/api/api_test.go` checks the gating with the flag on and off.
+The correctness suite (`go test ./internal/demo` and the UI's **Run default scenarios** in the benchmark section) always covers both behaviours, whatever the flag says. `internal/api/api_test.go` checks the gating with the flag on and off.
 
 ### Release history
 
@@ -171,3 +172,32 @@ The story: Alice opens doc:42 (snapshot at rev 3, her client keeps ver#3) → ad
 | Date | Change |
 |---|---|
 | 2026-10-18 | Introduced, enabled by default (PR #10) |
+
+## `FEATURE_LOG_REPLAY`
+
+**Benchmark log replay**: the benchmark section (formerly "Correctness tests") can replay an uploaded log of permission grants, revocations and checks against every strategy, besides running the default test scenarios.
+
+The log is JSON Lines or CSV (`ts,event,subject,object[,decision]`). `event` is `grant`, `revoke` or `check`; `ts` is an RFC 3339 timestamp or a number of seconds; bare IDs get the `user:` / `doc:` prefix. Each strategy (and fully consistent reads) gets its own world:
+- every world starts from an empty store and follows the log's timestamps;
+- cache entries expire after the TTL (300 s);
+- each invalidation is delivered a chosen delay after its commit (default 1000 ms).
+
+A check that carries the `decision` your system returned is evaluated too, as a "Your system" column. Limits: 20,000 events, 2 MB, one benchmark run at a time per server. Malformed lines, and revokes of permissions not granted at that point, are skipped and listed.
+
+The report gives each strategy's wrong decisions, stale ALLOWs, the **longest access after a revocation**, false DENYs, cache hit rate, checks sent to SQLite, and p50/p99 latency. It ends with a short summary: which strategies never let a revoked user keep access, which of them loads SQLite least, and how long the others let access linger.
+
+- **Default:** `true` (enabled)
+- **Code:** `internal/features` (flag), `internal/demo/replay.go` (`ParseLog`, `Replay`, `SampleLog`), `internal/api` (`/api/v1/tests/replay`, `/api/v1/tests/sample-log`), `web/src/components/LogReplay.tsx` and `TestsPanel.tsx` (UI)
+
+| | Enabled (`true`) | Disabled (`false`) |
+|---|---|---|
+| `POST /api/v1/tests/replay {log, invalidationMs?}` | Replays the log; `400` for an invalid log, `409` while another run is in progress | `404` |
+| `GET /api/v1/tests/sample-log` | Returns a 16-event sample log | `404` |
+| Benchmark section | Two tabs: "Default test scenarios" and "Upload your logs" (file upload, sample log, paste, invalidation delay, results table and summary) | Default test scenarios only |
+| `GET /api/v1/features` | `"logReplay":true` | `"logReplay":false` |
+
+### Release history
+
+| Date | Change |
+|---|---|
+| 2026-10-18 | Introduced, enabled by default (PR #13) |

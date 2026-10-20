@@ -274,3 +274,13 @@ tr.k-async td { background: var(--warn-wash); }
 .hop-label.k-fail { fill: var(--critical-ink); font-weight: 700; }
 tr.k-fail td { background: var(--critical-wash); }
 .outage-table { min-width: 760px; }
+
+/* Benchmark log replay */
+.replay .format pre { overflow-x: auto; background: var(--surface-2); padding: 8px 12px; border-radius: 8px; }
+.log-input { width: 100%; box-sizing: border-box; font-size: 0.8rem; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--axis); background: var(--page); color: var(--ink); resize: vertical; }
+.file-btn { position: relative; display: inline-flex; align-items: center; padding: 6px 14px; border-radius: 8px; border: 1px solid var(--axis); background: var(--surface); cursor: pointer; font-weight: 600; }
+.file-btn:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+.file-btn input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.ms-input { width: 7em; }
+.replay-table { min-width: 820px; }
+.recommendation { margin: 10px 0; }

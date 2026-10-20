@@ -234,3 +234,33 @@ func TestSQLiteFailureFlag(t *testing.T) {
 		t.Errorf("main demo: %d %v", code, r)
 	}
 }
+
+func TestLogReplayFlag(t *testing.T) {
+	off := serve(t, features.Flags{LogReplay: false})
+	if code, _ := call(t, off, "GET", "/api/v1/tests/sample-log", ""); code != http.StatusNotFound {
+		t.Errorf("flag off: sample log = %d, want 404", code)
+	}
+	if code, _ := call(t, off, "POST", "/api/v1/tests/replay", `{"log":"x"}`); code != http.StatusNotFound {
+		t.Errorf("flag off: replay = %d, want 404", code)
+	}
+
+	on := serve(t, features.Flags{LogReplay: true})
+	_, sample := call(t, on, "GET", "/api/v1/tests/sample-log", "")
+	body, _ := json.Marshal(map[string]any{"log": sample["log"], "invalidationMs": 1000})
+	code, r := call(t, on, "POST", "/api/v1/tests/replay", string(body))
+	if code != http.StatusOK || r["checks"] != float64(11) {
+		t.Fatalf("replay of the sample log: %d %v", code, r)
+	}
+	if ra := r["byStrategy"].(map[string]any)["revision_aware"].(map[string]any); ra["wrong"] != float64(0) {
+		t.Errorf("revision-aware on the sample log: %v", ra)
+	}
+	if code, _ := call(t, on, "POST", "/api/v1/tests/replay", `{"log":"not a log"}`); code != http.StatusBadRequest {
+		t.Errorf("invalid log = %d, want 400", code)
+	}
+	// Logs larger than the normal 16 KB request limit are accepted.
+	big := strings.Repeat(`{"ts":1,"event":"grant","subject":"alice","object":"42"}`+"\n", 400)
+	body, _ = json.Marshal(map[string]any{"log": big})
+	if code, r := call(t, on, "POST", "/api/v1/tests/replay", string(body)); code != http.StatusOK || r["grants"] != float64(400) {
+		t.Errorf("%d-byte log: %d %v", len(body), code, r["error"])
+	}
+}

@@ -112,11 +112,13 @@ A separate world (always the invalidation strategy) where you control the delive
 | after 3 deliveries | ✕ ALLOW | DENY | #4 queued at position 1 of 1 |
 | after 4 deliveries | ✓ DENY | DENY | none queued (read from SQLite) |
 
-## Correctness tests
+## Benchmark tests
 
-**Run correctness tests** on the page executes `demo.RunSuite()` on the server. CI runs the same code via `go test ./internal/demo`.
+The benchmark section has two inputs:
+- **Default test scenarios**: **Run default scenarios** executes `demo.RunSuite()` on the server. CI runs the same code via `go test ./internal/demo`.
+- **Upload your logs** (flag `FEATURE_LOG_REPLAY`): replays your own log of permission revocation and check events against every strategy. See [Benchmark your own logs](#benchmark-your-own-logs) below.
 
-![Correctness tests: all passed](docs/images/showcase-tests.png)
+![Benchmark tests: default scenarios, all passed](docs/images/showcase-tests.png)
 
 | Test | Strategy | What it proves |
 |---|---|---|
@@ -153,6 +155,42 @@ The suite reports p99 rather than the mean, because production latency targets a
 
 The modelled hop latencies are fixed, with no jitter or queueing, so p99 is exactly the miss path here. In production the SQLite path itself has a tail, and it grows with the share of checks sent to SQLite.
 
+### Benchmark your own logs
+
+Upload (or paste) a log in JSON Lines or CSV, one event per line:
+
+```text
+{"ts":"2026-10-18T09:00:00Z","event":"grant","subject":"user:alice","object":"doc:42"}
+{"ts":"2026-10-18T09:01:00Z","event":"revoke","subject":"user:alice","object":"doc:42"}
+{"ts":"2026-10-18T09:01:00.3Z","event":"check","subject":"user:alice","object":"doc:42","decision":"ALLOW"}
+
+ts,event,subject,object,decision
+0,grant,alice,42,
+60,revoke,alice,42,
+60.3,check,alice,42,ALLOW
+```
+
+How the replay works:
+- **Events:** `event` is `grant`, `revoke` or `check`. `ts` is an RFC 3339 timestamp or a number of seconds. Bare IDs get the `user:` / `doc:` prefix.
+- **Recorded decisions:** a check can carry the `decision` your system returned. Those decisions are then evaluated as a "Your system" column.
+- **Starting state:** each strategy replays the log from an empty store, in timestamp order. Include a grant for every permission that exists before the first check.
+- **Timing:** cache entries expire after the 300 s TTL. Invalidations are delivered after a delay you choose (default 1000 ms).
+- **Limits:** 20,000 events and 2 MB.
+
+The report covers, for each strategy and for fully consistent reads:
+- wrong decisions, stale ALLOWs and false DENYs;
+- the **longest time a revoked user kept access**;
+- cache hit rate and checks sent to SQLite;
+- p50 and p99 latency.
+
+A summary names the strategies that never let a revoked user keep access and the one that loads SQLite least. It also says how long the cheaper strategies let access linger, so you can match a strategy to your revocation requirement. On the built-in sample log:
+
+| | TTL cache | TTL + invalidation (1 s delay) | Revision-aware | Fully consistent | Recorded decisions |
+|---|---|---|---|---|---|
+| stale ALLOWs | 4 | 1 | **0** | **0** | 1 |
+| longest access after a revocation | 180 s | 300 ms | **0 s** | **0 s** | 300 ms |
+| checks sent to SQLite | 45.5% | 45.5% | 63.6% | 100% | — |
+
 ---
 
 ## Feature flags
@@ -166,6 +204,7 @@ Every feature ships behind a flag; see **[docs/FEATURES.md](docs/FEATURES.md)** 
 | `FEATURE_HAPPY_PATH_COMPARISON` | `true` | An invalidation read made while its event is queued also returns the happy-path result, shown side by side. Off: only the read's own result. |
 | `FEATURE_CLIENT_VERSION_TOKEN` | `true` | A revision-aware check can carry the client's own (possibly old) version token, or ask for a fully consistent read; the revision-aware story shows "at least as fresh as the token, not the latest". Off: checks always use the doc's latest token. |
 | `FEATURE_SQLITE_FAILURE` | `true` | A separate simulation where SQLite can be taken down: a check is answered from a cached snapshot at least as fresh as the requested revision, otherwise `503` ("no snapshot satisfies the revision"). Off: the section and the `/api/v1/outage/*` endpoints (404) are gone. |
+| `FEATURE_LOG_REPLAY` | `true` | The benchmark section can replay an uploaded log of permission grants, revocations and checks against every strategy (tab "Upload your logs"). Off: only the default test scenarios; the replay endpoints return 404. |
 | `FEATURE_AUTH` | `false` | *Planned*: authentication and user management (see [TODO.md](TODO.md)). |
 
 ## Run locally
@@ -195,7 +234,9 @@ All endpoints accept an `X-Lab-Session` header. Each session has two worlds, eac
 | `GET /api/v1/compare` | run the five-step story under every strategy |
 | `POST /api/v1/reset` | restore the starting state |
 | `GET /api/v1/audit?stale=true` | audit log of writes and checks |
-| `POST /api/v1/tests/run` | run the correctness suite (one run at a time per server; `409` while another run is in progress) |
+| `POST /api/v1/tests/run` | run the default test scenarios (one benchmark run at a time per server; `409` while another run is in progress) |
+| `POST /api/v1/tests/replay {log, invalidationMs?}` | replay an uploaded log (JSON Lines or CSV, up to 20,000 events / 2 MB) against every strategy; per-strategy stale ALLOWs, longest access after a revocation, SQLite reads, p50/p99 (flag `FEATURE_LOG_REPLAY`) |
+| `GET /api/v1/tests/sample-log` | a 16-event sample log |
 | `/api/v1/sim/{state,reset,check,grant,revoke,deliver}` | the same operations on the queue-simulation world (flag `FEATURE_CONTROLLED_CACHE_DELIVERY`) |
 | `POST /api/v1/sim/other-writes {count}` | commit 1–10 unrelated writes, each queueing its own invalidation event |
 | `/api/v1/outage/{state,reset,check,grant,revoke}` | the SQLite-failure world (revision-aware; `check` takes `token` and `consistency`). While SQLite is down, a check that no cached snapshot satisfies, and every write, returns `503` with an `unavailable` object (`requiredRev`, `snapshotRev`, `hops`, …) (flag `FEATURE_SQLITE_FAILURE`) |

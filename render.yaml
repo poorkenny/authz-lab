@@ -20,3 +20,5 @@ services:
         value: "true"
       - key: FEATURE_SQLITE_FAILURE
         value: "true"
+      - key: FEATURE_LOG_REPLAY
+        value: "true"
