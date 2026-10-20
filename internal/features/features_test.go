@@ -21,6 +21,7 @@ func TestFromEnv(t *testing.T) {
 		"FEATURE_CLIENT_VERSION_TOKEN":      func(f Flags) bool { return f.ClientVersionToken },
 		"FEATURE_SQLITE_FAILURE":            func(f Flags) bool { return f.SQLiteFailure },
 		"FEATURE_LOG_REPLAY":                func(f Flags) bool { return f.LogReplay },
+		"FEATURE_MULTI_POOL_INVALIDATION":   func(f Flags) bool { return f.MultiPoolInvalidation },
 	}
 	for name, get := range flags {
 		for _, c := range cases {

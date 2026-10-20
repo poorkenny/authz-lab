@@ -20,6 +20,7 @@ Every feature of the demo ships behind a **feature flag**, so it can be released
 | [`FEATURE_CLIENT_VERSION_TOKEN`](#feature_client_version_token) | `true` (enabled) | Released | PR #9 |
 | [`FEATURE_SQLITE_FAILURE`](#feature_sqlite_failure) | `true` (enabled) | Released | PR #10 |
 | [`FEATURE_LOG_REPLAY`](#feature_log_replay) | `true` (enabled) | Released | PR #13 |
+| [`FEATURE_MULTI_POOL_INVALIDATION`](#feature_multi_pool_invalidation) | `true` (enabled) | Released | PR #14 |
 | `FEATURE_AUTH` | `false` | Planned: authentication and user management (see [TODO.md](../TODO.md)) | not implemented |
 
 ## How to enable / disable a flag
@@ -201,3 +202,36 @@ The report gives each strategy's wrong decisions, stale ALLOWs, the **longest ac
 | Date | Change |
 |---|---|
 | 2026-10-18 | Introduced, enabled by default (PR #13) |
+
+## `FEATURE_MULTI_POOL_INVALIDATION`
+
+**Multiple invalidation pools: out-of-order delivery, races and the revision fence.** Section 3 (the invalidation-queue simulation) gets a second tab, "Multiple instances and pools". It has two service instances (A and B), each publishing the invalidation events of the writes it handles to its own pool, drained by its own worker. Events in one pool arrive in order; nothing orders them across pools. A worker can also **pick up an event and stall** (a GC pause) before writing it, so two workers race on one entry even when they picked their events in commit order.
+
+Each event carries the decision and revision of its commit. The **cache strategy** decides what applying it does:
+
+| Cache strategy | Applying an event | Older event arrives last |
+|---|---|---|
+| Retire the entry | Deletes the cached entry; the next read goes to SQLite | Harmless: deletes commute |
+| Refresh decision + rev | Writes the event's decision and revision into the cache | **Overwrites the newer entry**: a revoked user keeps access, with no event left to fix it, until the TTL (300 s) |
+| Refresh with revision fence | Writes it only if its revision is ≥ the cached revision (compare-and-set) | Discarded: an old grant never overwrites a newer revocation |
+
+**Event routing** is either each instance's own pool, or **partitioned by document** (all of a document's events go to one pool, which keeps them in commit order at the cost of one slow pool delaying all of its documents).
+
+Two guided scenarios run under the chosen settings: **out-of-order delivery** (Carol is granted through a backed-up instance A, revoked a second later through idle instance B) and **two workers race** (the worker holding Carol's grant stalls while her revoke is applied). Only "Refresh decision + rev" with per-instance pools ends with a stale ALLOW.
+
+The tab appears only when `FEATURE_CONTROLLED_CACHE_DELIVERY` is also on, since it lives in section 3.
+
+- **Default:** `true` (enabled)
+- **Code:** `internal/features` (flag), `internal/demo/pools.go` (`Pools`), `internal/api` (`/api/v1/pools/*`), `web/src/components/PoolsSimulation.tsx` and `QueueSimulation.tsx` (UI)
+
+| | Enabled (`true`) | Disabled (`false`) |
+|---|---|---|
+| Section 3 | Tabs "One queue" and "Multiple instances and pools" | The single queue only |
+| `/api/v1/pools/{state,reset,grant,revoke,other-writes,deliver,pick,check}` | Available | `404` |
+| `GET /api/v1/features` | `"multiPoolInvalidation":true` | `"multiPoolInvalidation":false` |
+
+### Release history
+
+| Date | Change |
+|---|---|
+| 2026-10-19 | Introduced, enabled by default (PR #14) |

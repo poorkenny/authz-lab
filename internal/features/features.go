@@ -35,11 +35,16 @@ type Flags struct {
 	// LogReplay: the benchmark section can replay an uploaded log of
 	// permission grants, revocations and checks against every strategy.
 	LogReplay bool `json:"logReplay"`
+	// MultiPoolInvalidation: the invalidation-queue simulation also shows
+	// several service instances with their own invalidation pools, where
+	// events for one entry can be applied out of order or race, and how
+	// retiring entries, a revision fence or partitioning by document avoids it.
+	MultiPoolInvalidation bool `json:"multiPoolInvalidation"`
 }
 
 // Defaults are the flag values used when no environment variable is set.
 func Defaults() Flags {
-	return Flags{ControlledCacheDelivery: true, StrategyStories: true, HappyPathComparison: true, ClientVersionToken: true, SQLiteFailure: true, LogReplay: true}
+	return Flags{ControlledCacheDelivery: true, StrategyStories: true, HappyPathComparison: true, ClientVersionToken: true, SQLiteFailure: true, LogReplay: true, MultiPoolInvalidation: true}
 }
 
 // FromEnv reads flags from environment variables, falling back to Defaults
@@ -52,6 +57,7 @@ func FromEnv(getenv func(string) string) Flags {
 	f.ClientVersionToken = boolFlag(getenv, "FEATURE_CLIENT_VERSION_TOKEN", f.ClientVersionToken)
 	f.SQLiteFailure = boolFlag(getenv, "FEATURE_SQLITE_FAILURE", f.SQLiteFailure)
 	f.LogReplay = boolFlag(getenv, "FEATURE_LOG_REPLAY", f.LogReplay)
+	f.MultiPoolInvalidation = boolFlag(getenv, "FEATURE_MULTI_POOL_INVALIDATION", f.MultiPoolInvalidation)
 	return f
 }
 

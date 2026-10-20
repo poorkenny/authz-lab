@@ -112,6 +112,21 @@ A separate world (always the invalidation strategy) where you control the delive
 | after 3 deliveries | ✕ ALLOW | DENY | #4 queued at position 1 of 1 |
 | after 4 deliveries | ✓ DENY | DENY | none queued (read from SQLite) |
 
+### Multiple instances and pools: out-of-order invalidation and races
+
+With flag `FEATURE_MULTI_POOL_INVALIDATION`, the tab **Multiple instances and pools** runs two service instances, each publishing its invalidation events to its own pool with its own worker. Events in one pool arrive in order, but nothing orders them across pools, and a worker can **pick up an event and stall** before writing it. Choose the cache strategy and the routing, then run a scenario:
+
+- **Out-of-order delivery:** Carol is granted through instance A, whose pool is backed up, then revoked a second later through idle instance B. B's revoke is applied first and A's older grant last.
+- **Two workers race:** the worker holding Carol's grant stalls, her revoke is applied, then the stalled worker finishes its write.
+
+| Cache strategy (per-instance pools) | Out-of-order delivery | Two workers race |
+|---|---|---|
+| Retire the entry (delete) | ✓ DENY: deletes commute | ✓ DENY |
+| Refresh decision + rev | ✕ **ALLOW, stuck until the TTL**: the older grant overwrote the newer revocation | ✕ ALLOW, stuck until the TTL |
+| Refresh with revision fence | ✓ DENY: the older event is discarded | ✓ DENY |
+
+**Partitioned by document** also fixes the refresh strategy (one worker applies a document's events in commit order), at the cost of one slow pool delaying all of its documents. The revision fence is a compare-and-set on the entry's revision: an event is written only if its revision is ≥ the cached one.
+
 ## Benchmark tests
 
 The benchmark section has two inputs:
@@ -205,6 +220,7 @@ Every feature ships behind a flag; see **[docs/FEATURES.md](docs/FEATURES.md)** 
 | `FEATURE_CLIENT_VERSION_TOKEN` | `true` | A revision-aware check can carry the client's own (possibly old) version token, or ask for a fully consistent read; the revision-aware story shows "at least as fresh as the token, not the latest". Off: checks always use the doc's latest token. |
 | `FEATURE_SQLITE_FAILURE` | `true` | A separate simulation where SQLite can be taken down: a check is answered from a cached snapshot at least as fresh as the requested revision, otherwise `503` ("no snapshot satisfies the revision"). Off: the section and the `/api/v1/outage/*` endpoints (404) are gone. |
 | `FEATURE_LOG_REPLAY` | `true` | The benchmark section can replay an uploaded log of permission grants, revocations and checks against every strategy (tab "Upload your logs"). Off: only the default test scenarios; the replay endpoints return 404. |
+| `FEATURE_MULTI_POOL_INVALIDATION` | `true` | Section 3 gets a "Multiple instances and pools" tab: per-instance invalidation pools, out-of-order delivery, a stalled-worker race, and the cache strategies retire / refresh / refresh with revision fence. Off: the single queue only; `/api/v1/pools/*` returns 404. |
 | `FEATURE_AUTH` | `false` | *Planned*: authentication and user management (see [TODO.md](TODO.md)). |
 
 ## Run locally
@@ -220,7 +236,7 @@ For development with hot reload: `make dev-api` (backend on :8080), then `make d
 
 ## API
 
-All endpoints accept an `X-Lab-Session` header. Each session has two worlds, each with its own in-memory SQLite database, cache and invalidation queue: the main demo (`/api/v1/...`) and the queue simulation (`/api/v1/sim/...`, always the invalidation strategy).
+All endpoints accept an `X-Lab-Session` header. Each session has its own worlds, each with its own in-memory SQLite database and cache: the main demo (`/api/v1/...`), the queue simulation (`/api/v1/sim/...`, always the invalidation strategy), the multi-pool simulation (`/api/v1/pools/...`) and the SQLite-failure simulation (`/api/v1/outage/...`).
 
 | Endpoint | Purpose |
 |---|---|
@@ -239,6 +255,9 @@ All endpoints accept an `X-Lab-Session` header. Each session has two worlds, eac
 | `GET /api/v1/tests/sample-log` | a 16-event sample log |
 | `/api/v1/sim/{state,reset,check,grant,revoke,deliver}` | the same operations on the queue-simulation world (flag `FEATURE_CONTROLLED_CACHE_DELIVERY`) |
 | `POST /api/v1/sim/other-writes {count}` | commit 1–10 unrelated writes, each queueing its own invalidation event |
+| `GET /api/v1/pools/state`, `POST /api/v1/pools/reset {mode, routing}` | the multi-pool world; `mode` is `retire`, `refresh` or `fenced` (revision fence), `routing` is `instance` or `document` (flag `FEATURE_MULTI_POOL_INVALIDATION`) |
+| `POST /api/v1/pools/{grant,revoke} {subject, object, instance}`, `POST /api/v1/pools/other-writes {count, instance}` | commit through instance 0 (A) or 1 (B); the event goes to that instance's pool or the document's pool |
+| `POST /api/v1/pools/{deliver,pick} {pool}`, `POST /api/v1/pools/check {subject, object}` | apply a pool's next event (or resume its stalled worker); pick one up and stall; read (`stuck` when stale with no event pending) |
 | `/api/v1/outage/{state,reset,check,grant,revoke}` | the SQLite-failure world (revision-aware; `check` takes `token` and `consistency`). While SQLite is down, a check that no cached snapshot satisfies, and every write, returns `503` with an `unavailable` object (`requiredRev`, `snapshotRev`, `hops`, …) (flag `FEATURE_SQLITE_FAILURE`) |
 | `POST /api/v1/outage/primary {down}` | take SQLite down (`true`) or bring it back (`false`) |
 

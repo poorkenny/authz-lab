@@ -1,9 +1,10 @@
 // Package api exposes the strategy showcase over HTTP. Every request is
 // scoped to a reviewer session via the X-Lab-Session header (the UI generates
 // one per browser), so reviewers on a shared instance never see each other's
-// state. A session holds up to three worlds: the main demo (any strategy),
-// the invalidation-queue simulation (always the invalidation strategy) and
-// the SQLite-failure simulation (revision-aware, created on first use).
+// state. A session holds up to four worlds: the main demo (any strategy),
+// the invalidation-queue simulation (always the invalidation strategy), the
+// multi-pool invalidation simulation and the SQLite-failure simulation
+// (revision-aware); the last two are created on first use.
 package api
 
 import (
@@ -17,6 +18,7 @@ import (
 	"github.com/poorkenny/authz-lab/internal/audit"
 	"github.com/poorkenny/authz-lab/internal/demo"
 	"github.com/poorkenny/authz-lab/internal/features"
+	"github.com/poorkenny/authz-lab/internal/store"
 )
 
 const (
@@ -35,7 +37,8 @@ type session struct {
 	mu       sync.Mutex
 	demo     *demo.Demo
 	sim      *demo.Demo
-	outage   *demo.Demo // nil until the SQLite-failure simulation is used
+	outage   *demo.Demo  // nil until the SQLite-failure simulation is used
+	pools    *demo.Pools // nil until the multi-pool simulation is used
 	lastUsed time.Time
 	tokens   float64
 	tokensAt time.Time
@@ -120,6 +123,9 @@ func (s *Server) drop(id string) {
 		if ss.outage != nil {
 			ss.outage.Close()
 		}
+		if ss.pools != nil {
+			ss.pools.Close()
+		}
 	}()
 }
 
@@ -176,6 +182,15 @@ func (s *Server) requireSQLiteFailure() error {
 func (s *Server) requireLogReplay() error {
 	if !s.flags.LogReplay {
 		return httpError{http.StatusNotFound, "log replay is disabled (FEATURE_LOG_REPLAY=false)"}
+	}
+	return nil
+}
+
+// requireMultiPool rejects requests for the multi-pool invalidation
+// simulation when its flag (or controlled delivery, which hosts it) is off.
+func (s *Server) requireMultiPool() error {
+	if !s.flags.MultiPoolInvalidation || !s.flags.ControlledCacheDelivery {
+		return httpError{http.StatusNotFound, "the multi-pool invalidation simulation is disabled (FEATURE_MULTI_POOL_INVALIDATION=false)"}
 	}
 	return nil
 }
@@ -269,6 +284,79 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			return nil, err
 		}
 		return (*d).SetPrimaryDown(req.Down), nil
+	}))
+
+	// The multi-pool invalidation simulation (FEATURE_MULTI_POOL_INVALIDATION).
+	mux.HandleFunc("GET /api/v1/pools/state", s.withPools(func(r *http.Request, p **demo.Pools) (any, error) {
+		return (*p).State()
+	}))
+	mux.HandleFunc("POST /api/v1/pools/reset", s.withPools(func(r *http.Request, p **demo.Pools) (any, error) {
+		var req struct {
+			Mode    string `json:"mode"`
+			Routing string `json:"routing"`
+		}
+		if err := decode(r, &req); err != nil {
+			return nil, err
+		}
+		fresh, err := demo.NewPools(req.Mode, req.Routing)
+		if err != nil {
+			return nil, badRequest(err)
+		}
+		(*p).Close()
+		*p = fresh
+		return fresh.State()
+	}))
+	for path, op := range map[string]store.Op{"grant": store.OpTouch, "revoke": store.OpDelete} {
+		mux.HandleFunc("POST /api/v1/pools/"+path, s.withPools(func(r *http.Request, p **demo.Pools) (any, error) {
+			var req struct {
+				Subject  string `json:"subject"`
+				Object   string `json:"object"`
+				Instance int    `json:"instance"`
+			}
+			if err := decode(r, &req); err != nil {
+				return nil, err
+			}
+			out, err := (*p).Write(op, req.Subject, req.Object, req.Instance)
+			if err != nil {
+				return nil, badRequest(err)
+			}
+			return out, nil
+		}))
+	}
+	mux.HandleFunc("POST /api/v1/pools/other-writes", s.withPools(func(r *http.Request, p **demo.Pools) (any, error) {
+		var req struct {
+			Count    int `json:"count"`
+			Instance int `json:"instance"`
+		}
+		if err := decode(r, &req); err != nil {
+			return nil, err
+		}
+		if req.Count < 1 || req.Count > 10 {
+			return nil, badRequest(errors.New("count must be between 1 and 10"))
+		}
+		out, err := (*p).AddOtherWrites(req.Count, req.Instance)
+		if err != nil {
+			return nil, badRequest(err)
+		}
+		return out, nil
+	}))
+	for path, f := range map[string]func(*demo.Pools, int) (demo.PoolDeliverResult, error){"deliver": (*demo.Pools).Deliver, "pick": (*demo.Pools).Pick} {
+		mux.HandleFunc("POST /api/v1/pools/"+path, s.withPools(func(r *http.Request, p **demo.Pools) (any, error) {
+			var req struct {
+				Pool int `json:"pool"`
+			}
+			if err := decode(r, &req); err != nil {
+				return nil, err
+			}
+			out, err := f(*p, req.Pool)
+			if err != nil {
+				return nil, badRequest(err)
+			}
+			return out, nil
+		}))
+	}
+	mux.HandleFunc("POST /api/v1/pools/check", s.withPools(func(r *http.Request, p **demo.Pools) (any, error) {
+		return withPair(r, (*p).Check)
 	}))
 
 	mux.HandleFunc("POST /api/v1/strategy", s.with(mainWorld, func(r *http.Request, d **demo.Demo) (any, error) {
@@ -390,8 +478,51 @@ func (s *Server) with(wd world, h func(r *http.Request, d **demo.Demo) (any, err
 	return s.withBody(wd, maxBody, h)
 }
 
+// withPools is with for the multi-pool invalidation simulation.
+func (s *Server) withPools(h func(r *http.Request, p **demo.Pools) (any, error)) http.HandlerFunc {
+	return s.withSession(maxBody, func(r *http.Request, ss *session) (any, error) {
+		if err := s.requireMultiPool(); err != nil {
+			return nil, err
+		}
+		if ss.pools == nil {
+			var err error
+			if ss.pools, err = demo.NewPools(demo.PoolRefresh, demo.PoolByInstance); err != nil {
+				return nil, err
+			}
+		}
+		return h(r, &ss.pools)
+	})
+}
+
 // withBody is with, accepting request bodies of up to limit bytes.
 func (s *Server) withBody(wd world, limit int64, h func(r *http.Request, d **demo.Demo) (any, error)) http.HandlerFunc {
+	return s.withSession(limit, func(r *http.Request, ss *session) (any, error) {
+		target := &ss.demo
+		switch wd {
+		case simWorld:
+			if err := s.requireControlledDelivery(); err != nil {
+				return nil, err
+			}
+			target = &ss.sim
+		case outageWorld:
+			if err := s.requireSQLiteFailure(); err != nil {
+				return nil, err
+			}
+			if ss.outage == nil {
+				var err error
+				if ss.outage, err = newOutage(); err != nil {
+					return nil, err
+				}
+			}
+			target = &ss.outage
+		}
+		return h(r, target)
+	})
+}
+
+// withSession resolves the session, rate-limits it, serializes access to it
+// and writes the handler's result or error.
+func (s *Server) withSession(limit int64, h func(r *http.Request, ss *session) (any, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get(sessionHdr)
 		if id == "" {
@@ -413,28 +544,7 @@ func (s *Server) withBody(wd world, limit int64, h func(r *http.Request, d **dem
 			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limit exceeded, slow down"})
 			return
 		}
-		target := &ss.demo
-		switch wd {
-		case simWorld:
-			if err := s.requireControlledDelivery(); err != nil {
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
-				return
-			}
-			target = &ss.sim
-		case outageWorld:
-			if err := s.requireSQLiteFailure(); err != nil {
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
-				return
-			}
-			if ss.outage == nil {
-				if ss.outage, err = newOutage(); err != nil {
-					writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-					return
-				}
-			}
-			target = &ss.outage
-		}
-		out, err := h(r, target)
+		out, err := h(r, ss)
 		if err != nil {
 			// SQLite is down and no cached snapshot can answer: 503, with the
 			// details (requested revision, snapshot revision, hops) for the UI.

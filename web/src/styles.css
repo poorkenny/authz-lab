@@ -284,3 +284,24 @@ tr.k-fail td { background: var(--critical-wash); }
 .ms-input { width: 7em; }
 .replay-table { min-width: 820px; }
 .recommendation { margin: 10px 0; }
+
+/* Multi-pool invalidation simulation (FEATURE_MULTI_POOL_INVALIDATION) */
+.pool-config { display: flex; flex-wrap: wrap; gap: 14px 24px; align-items: flex-start; margin: 12px 0 4px; }
+.pool-config .cfg { display: flex; flex-direction: column; gap: 4px; min-width: 0; max-width: 100%; }
+.pool-config .segmented { flex-wrap: wrap; max-width: 100%; }
+.pool-steps { list-style: none; margin: 8px 0 12px; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.pool-steps li { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center; }
+.pool-steps li.done button { opacity: 0.75; }
+.pool-free { margin: 6px 0; }
+.pool-lanes { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.stage-box.queue-lane.stalled { border-color: var(--warn); }
+.qcard.stalled { border-style: dashed; border-color: var(--warn); }
+.stall-tag { left: 6px; right: auto; }
+.sim-controls.tight { margin: 4px 0 0; }
+.applies { list-style: none; margin: 4px 0 0; padding: 6px 0 0; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 2px; }
+.outcome.bad { border-left-color: var(--critical); background: var(--critical-wash); }
+.outcome.good { border-left-color: var(--good); }
+@media (max-width: 520px) {
+  .pool-config .segmented { flex-direction: column; }
+  .pool-config .segmented button + button { border-left: none; border-top: 1px solid var(--border); }
+}

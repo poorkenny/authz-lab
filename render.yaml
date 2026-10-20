@@ -22,3 +22,5 @@ services:
         value: "true"
       - key: FEATURE_LOG_REPLAY
         value: "true"
+      - key: FEATURE_MULTI_POOL_INVALIDATION
+        value: "true"

@@ -10,6 +10,7 @@ export interface Features {
   clientVersionToken: boolean;
   sqliteFailure: boolean;
   logReplay: boolean;
+  multiPoolInvalidation: boolean;
 }
 
 export interface Hop {
@@ -217,4 +218,66 @@ export interface SuiteResult {
   cases: TestCase[];
   property: { seeds: number; opsPerRun: number; writes: number; deliveries: number; byStrategy: Record<Strategy, StrategyStats> };
   durationMs: number;
+}
+
+// The multi-pool invalidation simulation (FEATURE_MULTI_POOL_INVALIDATION).
+export type PoolMode = "retire" | "refresh" | "fenced";
+export type PoolRouting = "instance" | "document";
+
+export interface PoolEvent {
+  id: number;
+  pool: number;
+  subject: string;
+  object: string;
+  op: string;
+  rev: number;
+  decision: "ALLOW" | "DENY";
+}
+
+export interface PoolApply {
+  event: PoolEvent;
+  result: "retired" | "refreshed" | "discarded";
+  stale: boolean;
+  note: string;
+}
+
+export interface PoolsState {
+  mode: PoolMode;
+  routing: PoolRouting;
+  primaryRev: number;
+  tuples: string[];
+  queues: PoolEvent[][];
+  inflight: (PoolEvent | null)[];
+  cache: CacheEntry[];
+  history: PoolApply[];
+  docPool: number;
+  ttlSec: number;
+}
+
+export interface PoolWriteResult {
+  op: string;
+  tuple: string;
+  rev: number;
+  event: PoolEvent;
+  note: string;
+}
+
+export interface PoolDeliverResult {
+  delivered: boolean;
+  apply?: PoolApply;
+  note: string;
+}
+
+export interface PoolCheckResult {
+  subject: string;
+  object: string;
+  decision: "ALLOW" | "DENY";
+  expected: "ALLOW" | "DENY";
+  correct: boolean;
+  servedBy: "cache" | "primary";
+  cacheRev: number;
+  primaryRev: number;
+  pending: number;
+  stuck: boolean;
+  reason: string;
 }

@@ -1,4 +1,4 @@
-import type { CheckOpts, CheckResult, ClockResult, CompareRow, DeliverResult, Features, PrimaryResult, ReplayResult, State, Strategy, SuiteResult, WriteResult } from "./types";
+import type { CheckOpts, CheckResult, ClockResult, CompareRow, DeliverResult, Features, PoolCheckResult, PoolDeliverResult, PoolMode, PoolRouting, PoolsState, PoolWriteResult, PrimaryResult, ReplayResult, State, Strategy, SuiteResult, WriteResult } from "./types";
 
 const SESSION_KEY = "authz-lab-session";
 let memorySession = "";
@@ -75,5 +75,16 @@ export const api = {
     grant: (subject: string, object: string) => call<WriteResult>("POST", "/api/v1/outage/grant", { subject, object }),
     revoke: (subject: string, object: string) => call<WriteResult>("POST", "/api/v1/outage/revoke", { subject, object }),
     setPrimary: (down: boolean) => call<PrimaryResult>("POST", "/api/v1/outage/primary", { down }),
+  },
+  // The multi-pool invalidation simulation (FEATURE_MULTI_POOL_INVALIDATION).
+  pools: {
+    state: () => call<PoolsState>("GET", "/api/v1/pools/state"),
+    reset: (mode: PoolMode, routing: PoolRouting) => call<PoolsState>("POST", "/api/v1/pools/reset", { mode, routing }),
+    grant: (subject: string, object: string, instance: number) => call<PoolWriteResult>("POST", "/api/v1/pools/grant", { subject, object, instance }),
+    revoke: (subject: string, object: string, instance: number) => call<PoolWriteResult>("POST", "/api/v1/pools/revoke", { subject, object, instance }),
+    otherWrites: (count: number, instance: number) => call<PoolWriteResult[]>("POST", "/api/v1/pools/other-writes", { count, instance }),
+    deliver: (pool: number) => call<PoolDeliverResult>("POST", "/api/v1/pools/deliver", { pool }),
+    pick: (pool: number) => call<PoolDeliverResult>("POST", "/api/v1/pools/pick", { pool }),
+    check: (subject: string, object: string) => call<PoolCheckResult>("POST", "/api/v1/pools/check", { subject, object }),
   },
 };
